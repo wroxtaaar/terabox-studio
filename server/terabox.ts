@@ -282,7 +282,7 @@ function normalizeDiskwalaFile(
     file.fileName ||
     file.file_name ||
     file.title ||
-    \`diskwala_file_\${fallbackIndex + 1}.bin\`
+    `diskwala_file_${fallbackIndex + 1}.bin`
   );
 
   const downloadUrlCandidate =
@@ -361,7 +361,7 @@ function parseDiskwalaResponse(data: any): ResolvedTeraboxFile[] {
   for (let i = 0; i < candidates.length; i++) {
     const parsed = normalizeDiskwalaFile(candidates[i], i);
     if (!parsed) continue;
-    const key = \`\${parsed.filename}|\${parsed.downloadUrl || ""}|\${parsed.streamUrl || ""}\`;
+    const key = `${parsed.filename}|${parsed.downloadUrl || ""}|${parsed.streamUrl || ""}`;
     if (seen.has(key)) continue;
     seen.add(key);
     files.push(parsed);
@@ -407,13 +407,13 @@ async function requestDiskwalaProxy(
         data?.detail ||
         data?.message ||
         data?.error ||
-        (rawText ? rawText.slice(0, 300) : \`HTTP \${response.status}\`);
-      throw new Error(\`\${label} returned HTTP \${response.status}: \${detail}\`);
+        (rawText ? rawText.slice(0, 300) : `HTTP ${response.status}`);
+      throw new Error(`${label} returned HTTP ${response.status}: ${detail}`);
     }
 
     const files = parseDiskwalaResponse(data);
     if (files.length === 0) {
-      throw new Error(\`\${label} returned no usable direct media URL\`);
+      throw new Error(`${label} returned no usable direct media URL`);
     }
 
     return files;
@@ -425,8 +425,8 @@ async function requestDiskwalaProxy(
 async function resolveDiskwalaViaPublicPage(normalizedUrl: string, id: string): Promise<ResolvedMetadata | null> {
   const candidateUrls = [
     normalizedUrl,
-    \`https://www.diskwala.com/file/\${id}\`,
-    \`https://www.diskwala.com/app/\${id}\`,
+    `https://www.diskwala.com/file/${id}`,
+    `https://www.diskwala.com/app/${id}`,
   ];
 
   for (const pageUrl of [...new Set(candidateUrls)]) {
@@ -462,14 +462,14 @@ async function resolveDiskwalaViaPublicPage(normalizedUrl: string, id: string): 
       const rawTitle =
         titleMatch?.[1]?.trim() ||
         descriptionMatch?.[1]?.trim() ||
-        \`Diskwala_File_\${id}\`;
+        `Diskwala_File_${id}`;
       const fileTitle =
         rawTitle.replace(/\s*[-|–]\s*DiskWala.*$/i, "").trim() ||
-        \`Diskwala_File_\${id}\`;
+        `Diskwala_File_${id}`;
       const fileName = cleanFilename(
         /\.[a-z0-9]{2,5}$/i.test(fileTitle)
           ? fileTitle
-          : \`\${fileTitle}.mp4\`
+          : `${fileTitle}.mp4`
       );
       const isVideo = VIDEO_EXTENSIONS.has(path.extname(fileName).toLowerCase());
 
@@ -506,7 +506,7 @@ export async function resolveDiskwalaLink(rawUrl: string): Promise<ResolvedMetad
   const normalizedUrl =
     /^https?:\/\//i.test(cleanUrl) && /diskwala/i.test(cleanUrl)
       ? cleanUrl
-      : \`https://www.diskwala.com/app/\${id}\`;
+      : `https://www.diskwala.com/app/${id}`;
 
   const failures: string[] = [];
   const apiKey = process.env.DISKWALA_API_KEY?.trim();
@@ -596,7 +596,7 @@ export async function resolveDiskwalaLink(rawUrl: string): Promise<ResolvedMetad
     }
 
     if (!apiRes.ok) {
-      throw new Error(\`Shared Diskwala resolver returned HTTP \${apiRes.status}\`);
+      throw new Error(`Shared Diskwala resolver returned HTTP ${apiRes.status}`);
     }
 
     const files = parseDiskwalaResponse(data);
@@ -611,7 +611,7 @@ export async function resolveDiskwalaLink(rawUrl: string): Promise<ResolvedMetad
     }
 
     if (data?.error === "quota_exceeded") {
-      failures.push(\`Shared Diskwala resolver quota exceeded: \${data.message || "quota exceeded"}\`);
+      failures.push(`Shared Diskwala resolver quota exceeded: ${data.message || "quota exceeded"}`);
     } else {
       failures.push("Shared Diskwala resolver returned no usable direct media URL");
     }
@@ -625,7 +625,7 @@ export async function resolveDiskwalaLink(rawUrl: string): Promise<ResolvedMetad
   if (publicPageFallback) return publicPageFallback;
 
   throw new Error(
-    \`Diskwala link could not be resolved to a downloadable media URL. \${failures.join(" | ")}\`
+    `Diskwala link could not be resolved to a downloadable media URL. ${failures.join(" | ")}`
   );
 }
 
