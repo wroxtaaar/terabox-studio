@@ -607,7 +607,10 @@ export async function resolveTeraboxLink(rawUrl: string): Promise<ResolvedMetada
     const response = await fetch(cleanUrl, { headers, redirect: "follow" });
     finalUrl = response.url || cleanUrl;
     pageText = await response.text();
-    const rawCookies = response.headers.get("set-cookie") || "";
+    const setCookieValues = (response.headers as any).getSetCookie?.() || [];
+    const rawCookies = setCookieValues.length
+      ? setCookieValues.join(", ")
+      : response.headers.get("set-cookie") || "";
     if (rawCookies) {
       cookieHeader = rawCookies
         .split(/,(?=[^;,]+=)/)
@@ -646,33 +649,81 @@ export async function resolveTeraboxLink(rawUrl: string): Promise<ResolvedMetada
   if (finalSurl) {
     const variations = [finalSurl, finalSurl.startsWith("1") ? finalSurl.slice(1) : "1" + finalSurl]
       .filter((value, index, values) => value && values.indexOf(value) === index);
+    const infoOrigins = [...new Set([
+      apiOrigin,
+      "https://www.terabox.app",
+      "https://www.terabox.com",
+      "https://www.1024tera.com",
+    ])];
+
     for (const surlVariant of variations) {
-      try {
-        const infoUrl = new URL("/api/shorturlinfo", apiOrigin);
-        infoUrl.searchParams.set("app_id", "250528");
-        infoUrl.searchParams.set("shorturl", surlVariant);
-        infoUrl.searchParams.set("root", "1");
-        infoUrl.searchParams.set("web", "1");
-        infoUrl.searchParams.set("channel", "dubox");
-        infoUrl.searchParams.set("clienttype", "0");
-        if (jsToken) infoUrl.searchParams.set("jsToken", jsToken);
-        const apiRes = await fetch(infoUrl, {
-          headers: { ...headers, Referer: finalUrl, ...(cookieHeader ? { Cookie: cookieHeader } : {}) },
-        });
-        if (!apiRes.ok) continue;
-        const apiData = (await apiRes.json()) as any;
-        if (Number(apiData?.errno) !== 0 || !Array.isArray(apiData?.list)) continue;
-        shareId = apiData.shareid ? String(apiData.shareid) : undefined;
-        uk = apiData.uk ? String(apiData.uk) : undefined;
-        sign = apiData.sign ? String(apiData.sign) : undefined;
-        timestamp = apiData.timestamp ? String(apiData.timestamp) : undefined;
-        randsk = apiData.randsk ? decodeURIComponent(String(apiData.randsk)) : undefined;
-        title = apiData.title ? cleanFilename(String(apiData.title)) : "";
-        allItems.push(...apiData.list);
-        break;
-      } catch (error) {
-        console.warn("TeraBox shorturlinfo attempt failed:", error);
+      let infoResolved = false;
+      for (const infoOrigin of infoOrigins) {
+        try {
+          const infoUrl = new URL("/api/shorturlinfo", infoOrigin);
+          infoUrl.searchParams.set("app_id", "250528");
+          infoUrl.searchParams.set("shorturl", surlVariant);
+          infoUrl.searchParams.set("root", "1");
+          infoUrl.searchParams.set("web", "1");
+          infoUrl.searchParams.set("channel", "dubox");
+          infoUrl.searchParams.set("clienttype", "0");
+          if (jsToken) infoUrl.searchParams.set("jsToken", jsToken);
+          if (dpLogId) infoUrl.searchParams.set("dp-logid", dpLogId);
+
+          const apiRes = await fetch(infoUrl, {
+            headers: {
+              ...headers,
+              Accept: "application/json, text/plain, */*",
+              "X-Requested-With": "XMLHttpRequest",
+              Referer: finalUrl,
+              ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+            },
+          });
+
+          if (!apiRes.ok) {
+            console.warn(
+              "TeraBox shorturlinfo HTTP " + apiRes.status +
+              " origin=" + infoOrigin + " shorturl=" + surlVariant
+            );
+            continue;
+          }
+
+          const apiData = (await apiRes.json()) as any;
+          const infoErrno = Number(apiData?.errno ?? 0);
+          if (infoErrno !== 0 || !Array.isArray(apiData?.list)) {
+            console.warn(
+              "TeraBox shorturlinfo rejected origin=" + infoOrigin +
+              " shorturl=" + surlVariant +
+              " errno=" + infoErrno +
+              " errmsg=" + (apiData?.errmsg || "none")
+            );
+            continue;
+          }
+
+          console.log(
+            "TeraBox shorturlinfo resolved origin=" + infoOrigin +
+            " shorturl=" + surlVariant +
+            " items=" + apiData.list.length
+          );
+
+          shareId = apiData.shareid ? String(apiData.shareid) : undefined;
+          uk = apiData.uk ? String(apiData.uk) : undefined;
+          sign = apiData.sign ? String(apiData.sign) : undefined;
+          timestamp = apiData.timestamp ? String(apiData.timestamp) : undefined;
+          randsk = apiData.randsk ? decodeURIComponent(String(apiData.randsk)) : undefined;
+          title = apiData.title ? cleanFilename(String(apiData.title)) : "";
+          allItems.push(...apiData.list);
+          infoResolved = true;
+          break;
+        } catch (error) {
+          console.warn(
+            "TeraBox shorturlinfo request failed origin=" + infoOrigin +
+            " shorturl=" + surlVariant + ":",
+            error
+          );
+        }
       }
+      if (infoResolved) break;
     }
   }
 
@@ -755,6 +806,7 @@ export async function resolveTeraboxLink(rawUrl: string): Promise<ResolvedMetada
       "sign=" + (sign ? "yes" : "no"),
       "timestamp=" + (timestamp ? "yes" : "no"),
       "dpLogId=" + (dpLogId ? "yes" : "no"),
+      "cookies=" + (cookieHeader ? "yes" : "no"),
       "finalHost=" + (() => { try { return new URL(finalUrl).host; } catch { return "unknown"; } })(),
     ].join(", ");
     throw new Error("No downloadable files were found in this TeraBox link (" + diagnostic + ").");
