@@ -621,9 +621,9 @@ export async function resolveDiskwalaLink(rawUrl: string): Promise<ResolvedMetad
     console.warn("Diskwala shared resolver failed:", err);
   }
 
-  const publicPageFallback = await resolveDiskwalaViaPublicPage(normalizedUrl, id);
-  if (publicPageFallback) return publicPageFallback;
-
+  // Do not scrape the public Diskwala HTML page as a download fallback.
+  // A share page can contain unrelated site assets (for example a tiny
+  // homepage/demo MP4), which can be mistaken for the user's file.
   throw new Error(
     `Diskwala link could not be resolved to a downloadable media URL. ${failures.join(" | ")}`
   );
