@@ -203,16 +203,12 @@ export function extractSurl(rawUrl: string): string | null {
   try {
     const urlObj = new URL(rawUrl);
     const surlParam = urlObj.searchParams.get("surl");
-    if (surlParam) {
-      return surlParam.replace(/^1/, "");
-    }
-    const match = rawUrl.match(/\/s\/(?:1)?([a-zA-Z0-9_-]+)/);
-    if (match) {
-      return match[1].replace(/^1/, "");
-    }
+    if (surlParam) return surlParam;
+    const match = rawUrl.match(/\/s\/([a-zA-Z0-9_-]+)/i);
+    if (match) return match[1];
   } catch {
-    const m = rawUrl.match(/(?:surl=|s\/)(?:1)?([a-zA-Z0-9_-]+)/i);
-    if (m) return m[1].replace(/^1/, "");
+    const m = rawUrl.match(/(?:surl=|s\/)([a-zA-Z0-9_-]+)/i);
+    if (m) return m[1];
   }
   return null;
 }
@@ -525,8 +521,15 @@ async function fetchTeraboxShareList(
         headers: {
           "User-Agent":
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-          Accept: "application/json, text/plain, */*",
-          "Accept-Language": "en-US,en;q=0.9",
+          Accept:
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
+          "Sec-Fetch-Dest": "document",
+          "Sec-Fetch-Mode": "navigate",
+          "Sec-Fetch-Site": "same-origin",
+          "Sec-Fetch-User": "?1",
+          "Upgrade-Insecure-Requests": "1",
+          "X-Requested-With": "XMLHttpRequest",
           Referer: refererUrl || apiOrigin + "/",
           ...(cookieHeader ? { Cookie: cookieHeader } : {}),
         },
@@ -622,6 +625,8 @@ export async function resolveTeraboxLink(rawUrl: string): Promise<ResolvedMetada
     console.warn("Error fetching initial TeraBox page:", fetchErr);
   }
 
+  // Keep the leading "1" from the public share URL. Current TeraBox share/list
+  // implementations expect the original shorturl value (for example 1abc...).
   const finalSurl = extractSurl(finalUrl) || shortCode || "";
   const jsTokenMatch =
     pageText.match(/fn\("([A-F0-9]+)"\)/i) ||
@@ -729,6 +734,9 @@ export async function resolveTeraboxLink(rawUrl: string): Promise<ResolvedMetada
 
   if (finalSurl && jsToken) {
     try {
+      // The share/list endpoint is the primary resolver. Unlike shorturlinfo,
+      // it is still used by current open-source clients with the original
+      // "1..." shorturl and returns dlink/server_filename directly.
       const rootItems = await fetchTeraboxShareList(apiOrigin, finalSurl, jsToken, cookieHeader, finalUrl, undefined, dpLogId);
       allItems.push(...rootItems);
       const pendingDirs = rootItems.filter((item) => String(item?.isdir ?? "0") === "1");
