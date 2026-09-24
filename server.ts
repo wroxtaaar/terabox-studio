@@ -29,6 +29,8 @@ import { formatLinkCounter, getLinkCounterForUrl, normalizeLink } from "./src/li
 
 const PORT = Number(process.env.PORT) || 3000;
 const MAX_QUEUE_SIZE = Number(process.env.MAX_QUEUE_SIZE) || 100;
+const MAX_RETRY_ATTEMPTS = 1;
+const RETRY_DELAY_MS = 1500;
 const MAX_FILES_PER_LINK = 25;
 const MAX_SOURCE_FILE_SIZE_BYTES = 512 * 1024 * 1024;
 const MAX_ZIP_SIZE_BYTES = 250 * 1024 * 1024;
@@ -46,6 +48,23 @@ async function streamResponseToFile(response: Response, filePath: string) {
   );
 }
 
+async function withRetries<T>(operation: () => Promise<T>, label: string): Promise<T> {
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= MAX_RETRY_ATTEMPTS; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      console.warn(`${label} failed (attempt ${attempt}/${MAX_RETRY_ATTEMPTS}):`, error);
+      if (attempt < MAX_RETRY_ATTEMPTS) {
+        await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS * attempt));
+      }
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(`${label} failed`);
+}
 
 // Track public base URL for direct download links
 let appPublicUrl =
@@ -198,14 +217,23 @@ type DownloadQueueTask = {
   sizeBytes?: number;
   sizeIsEstimated?: boolean;
   cancelRequested?: boolean;
+  retryCount?: number;
   queuedAt: number;
   resolve: (job: DownloadJob) => void;
   reject: (error: unknown) => void;
 };
 
+type RetryQueueItem = {
+  url: string;
+  chatId?: number | string;
+  fileNames: string[] | null;
+  retryCount: number;
+  maxRetries: number;
+};
 
 const sizeInspectionQueue: DownloadQueueTask[] = [];
 const downloadQueue: DownloadQueueTask[] = [];
+const retryQueue: RetryQueueItem[] = [];
 let isSizeInspectionInProgress = false;
 let isDownloadInProgress = false;
 let activeTask: DownloadQueueTask | null = null;
@@ -229,6 +257,34 @@ function getNextQueuedTask(): DownloadQueueTask | undefined {
   return downloadQueue.shift();
 }
 
+function getRetryDisplayName(fileNames: string[] | null, url: string): string {
+  const firstName = fileNames?.find((name) => !!name?.trim());
+  if (firstName) return firstName;
+
+  try {
+    const parsed = new URL(url);
+    const fallback = decodeURIComponent(parsed.pathname).split("/").filter(Boolean).pop();
+    return fallback || "download";
+  } catch {
+    return "download";
+  }
+}
+
+function getRetryLabel(item: Pick<RetryQueueItem, "fileNames" | "url" | "retryCount" | "maxRetries">): string {
+  return `${getRetryDisplayName(item.fileNames, item.url)} (retry ${item.retryCount}/${item.maxRetries})`;
+}
+
+function shouldRetryLink(retryCount: number, maxRetries: number): boolean {
+  return false;
+}
+
+function queueRetryJob(url: string, chatId?: number | string, fileNames: string[] | null = null, retryCount = 1): void {
+  void url;
+  void chatId;
+  void fileNames;
+  void retryCount;
+}
+
 function getKnownDownloadedSize(url: string): number | undefined {
   const normalizedUrl = normalizeLink(url);
   const previousJob = jobs.find((job) => {
@@ -242,7 +298,10 @@ function getKnownDownloadedSize(url: string): number | undefined {
 async function resolveQueuedFileNames(task: DownloadQueueTask) {
   try {
     const resolver = isDiskwalaUrl(task.url) ? resolveDiskwalaLink : resolveTeraboxLink;
-    const metadata = await resolver(task.url);
+    const metadata = await withRetries(
+      () => resolver(task.url),
+      "Queued link inspection"
+    );
     task.fileNames = metadata.files.map((file) => cleanFilename(file.filename));
     const totalEstimatedBytes = metadata.files.reduce((sum, file) => sum + (file.sizeBytes || 0), 0);
     const knownDownloadedSize = getKnownDownloadedSize(task.url);
@@ -274,6 +333,18 @@ function processSizeInspectionQueue(): void {
 function processDownloadQueue() {
   if (isDownloadInProgress) return;
 
+  if (getDownloadQueueLength() === 0 && retryQueue.length > 0) {
+    const retryItem = retryQueue.shift()!;
+    downloadQueue.push({
+      url: retryItem.url,
+      chatId: retryItem.chatId,
+      fileNames: retryItem.fileNames,
+      retryCount: retryItem.retryCount,
+      queuedAt: Date.now(),
+      resolve: () => undefined,
+      reject: () => undefined,
+    });
+  }
 
   const task = getNextQueuedTask();
   if (!task) return;
@@ -281,7 +352,7 @@ function processDownloadQueue() {
   activeTask = task;
   isDownloadInProgress = true;
 
-  processDownloadJob(task, task.url, task.chatId)
+  processDownloadJob(task, task.url, task.chatId, task.retryCount ?? 0)
     .then((job) => {
       if (task.resolve) task.resolve(job);
     })
@@ -423,6 +494,7 @@ async function pollTelegramUpdates() {
             `📥 *Active Jobs:* ${activeCount}\n` +
             `🔎 *Finding sizes:* ${sizeInspectionQueue.length + (isSizeInspectionInProgress ? 1 : 0)}\n` +
             `📦 *Ready to download:* ${downloadQueue.length}\n` +
+            `🔁 *Retry Queue:* ${retryQueue.length}\n` +
             `📁 *Total Processed:* ${jobs.length}`
         );
         continue;
@@ -569,7 +641,8 @@ function stopPolling() {
 async function processDownloadJob(
   queueTask: DownloadQueueTask,
   url: string,
-  chatId?: number | string
+  chatId?: number | string,
+  retryCount = 0
 ): Promise<DownloadJob> {
   const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   const jobDir = path.join(DOWNLOADS_DIR, jobId);
@@ -585,6 +658,8 @@ async function processDownloadJob(
     statusText: "Analyzing TeraBox share link...",
     files: [],
     chatId: chatId ? String(chatId) : undefined,
+    retryCount,
+    maxRetries: MAX_RETRY_ATTEMPTS,
     createdAt: Date.now(),
     logs: [`[${new Date().toLocaleTimeString()}] Job initialized for ${url} (link ${formatLinkCounter(url)})`],
   };
@@ -609,7 +684,10 @@ async function processDownloadJob(
 
   try {
     await updateStatus("resolving", 25, isDiskwalaUrl(url) ? "Checking your Diskwala link..." : "Checking your TeraBox link...");
-    const metadata = await (isDiskwalaUrl(url) ? resolveDiskwalaLink(url) : resolveTeraboxLink(url));
+    const metadata = await withRetries(
+      () => (isDiskwalaUrl(url) ? resolveDiskwalaLink(url) : resolveTeraboxLink(url)),
+      isDiskwalaUrl(url) ? "Diskwala link resolution" : "TeraBox link resolution"
+    );
 
     const processedFiles: ProcessedFile[] = [];
     const sourceFiles = metadata.files.filter((file) => file.downloadUrl || file.streamUrl);
@@ -659,17 +737,23 @@ async function processDownloadJob(
 
         if (sourceFile.downloadUrl) {
           try {
-            const streamRes = await fetch(sourceFile.downloadUrl!, {
-              headers: {
-                "User-Agent":
-                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0",
-                Referer: metadata.refererUrl || "https://www.terabox.app/",
-                ...(metadata.cookies ? { Cookie: metadata.cookies } : {}),
+            const streamRes = await withRetries(
+              async () => {
+                const response = await fetch(sourceFile.downloadUrl!, {
+                  headers: {
+                    "User-Agent":
+                      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0",
+                    Referer: metadata.refererUrl || "https://www.terabox.app/",
+                    ...(metadata.cookies ? { Cookie: metadata.cookies } : {}),
+                  },
+                });
+                if (!response.ok) {
+                  throw new Error(`Download returned HTTP ${response.status}`);
+                }
+                return response;
               },
-            });
-            if (!streamRes.ok) {
-              throw new Error(`Download returned HTTP ${streamRes.status}`);
-            }
+              `Direct download for ${displayName}`
+            );
             await streamResponseToFile(streamRes, downloadedFilePath);
             hasDownloadedFile = fs.statSync(downloadedFilePath).size > 0;
           } catch (downloadErr) {
@@ -684,15 +768,18 @@ async function processDownloadJob(
             downloadedFilePath = path.join(jobDir, `${fileIndex}_${candidateName}`);
           }
 
-          if (fs.existsSync(downloadedFilePath)) {
-            fs.rmSync(downloadedFilePath, { force: true });
-          }
-          await downloadM3u8Stream(
-            sourceFile.streamUrl!,
-            downloadedFilePath,
-            metadata.refererUrl || "https://www.terabox.app/",
-            metadata.cookies,
-            async (percent) => {                  const fileStart = 20 + Math.round((fileIndex / sourceFiles.length) * 60);
+          await withRetries(
+            async () => {
+              if (fs.existsSync(downloadedFilePath)) {
+                fs.rmSync(downloadedFilePath, { force: true });
+              }
+              await downloadM3u8Stream(
+                sourceFile.streamUrl!,
+                downloadedFilePath,
+                metadata.refererUrl || "https://www.terabox.app/",
+                metadata.cookies,
+                async (percent) => {
+                  const fileStart = 20 + Math.round((fileIndex / sourceFiles.length) * 60);
                   const fileProgress = Math.round(60 / sourceFiles.length);
                   const calculatedProgress = Math.min(80, fileStart + Math.round((percent / 100) * fileProgress));
                   await updateStatus(
@@ -701,16 +788,19 @@ async function processDownloadJob(
                     `Downloading ${displayName}... ${percent}%`,
                     processingSizeLabel
                   );
+                },
+                {
+                  duration: sourceFile.duration,
+                  shareId: metadata.shareId,
+                  uk: metadata.uk,
+                  sign: metadata.sign || sourceFile.sign,
+                  timestamp: metadata.timestamp || sourceFile.timestamp,
+                  fsId: sourceFile.fsId,
+                  randsk: metadata.randsk,
+                }
+              );
             },
-            {
-              duration: sourceFile.duration,
-              shareId: metadata.shareId,
-              uk: metadata.uk,
-              sign: metadata.sign || sourceFile.sign,
-              timestamp: metadata.timestamp || sourceFile.timestamp,
-              fsId: sourceFile.fsId,
-              randsk: metadata.randsk,
-            }
+            `Video download for ${displayName}`
           );
 
           if (fs.existsSync(downloadedFilePath) && fs.statSync(downloadedFilePath).size > 0) {
