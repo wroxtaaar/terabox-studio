@@ -242,21 +242,201 @@ export interface ResolvedMetadata {
   refererUrl?: string;
 }
 
+function parseDiskwalaSize(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value)) return Math.max(0, Math.trunc(value));
+  if (typeof value !== "string") return 0;
+
+  const text = value.trim();
+  if (!text) return 0;
+
+  const numeric = Number(text);
+  if (Number.isFinite(numeric)) return Math.max(0, Math.trunc(numeric));
+
+  const match = text.match(/^([0-9]+(?:\.[0-9]+)?)\s*(B|KB|MB|GB|TB)$/i);
+  if (!match) return 0;
+
+  const amount = Number(match[1]);
+  const unit = match[2].toUpperCase();
+  const multiplier =
+    unit === "TB" ? 1024 ** 4 :
+    unit === "GB" ? 1024 ** 3 :
+    unit === "MB" ? 1024 ** 2 :
+    unit === "KB" ? 1024 :
+    1;
+
+  return Number.isFinite(amount) ? Math.max(0, Math.trunc(amount * multiplier)) : 0;
+}
+
+function isUsableHttpUrl(value: unknown): value is string {
+  return typeof value === "string" && /^https?:\/\//i.test(value.trim());
+}
+
+function normalizeDiskwalaFile(
+  rawFile: any,
+  fallbackIndex: number
+): ResolvedTeraboxFile | null {
+  const file = rawFile || {};
+  const filename = cleanFilename(
+    file.name ||
+    file.filename ||
+    file.fileName ||
+    file.file_name ||
+    file.title ||
+    \`diskwala_file_\${fallbackIndex + 1}.bin\`
+  );
+
+  const downloadUrlCandidate =
+    file.url ||
+    file.downloadUrl ||
+    file.download_url ||
+    file.direct_link ||
+    file.directLink ||
+    file.fast_download;
+
+  const streamUrlCandidate =
+    file.m3u8_url ||
+    file.m3u8Url ||
+    file.stream_url ||
+    file.streamUrl ||
+    file.hls_url ||
+    file.hlsUrl;
+
+  const downloadUrl = isUsableHttpUrl(downloadUrlCandidate)
+    ? downloadUrlCandidate.trim()
+    : undefined;
+  const streamUrl = isUsableHttpUrl(streamUrlCandidate)
+    ? streamUrlCandidate.trim()
+    : undefined;
+
+  if (!downloadUrl && !streamUrl) return null;
+
+  const size = parseDiskwalaSize(
+    file.sizebytes ??
+    file.sizeBytes ??
+    file.size ??
+    file.file_size ??
+    file.fileSize
+  );
+
+  const ext = path.extname(filename).toLowerCase();
+  const isVideo = VIDEO_EXTENSIONS.has(ext) ||
+    /\.(mp4|mkv|webm|avi|mov|m4v|mpeg|mpg|3gp|ts|flv|m3u8)$/i.test(filename);
+  const isZip = /\.(zip|rar|7z|tar|gz)$/i.test(filename);
+
+  return {
+    filename,
+    sizeBytes: size,
+    sizeFormatted: size > 0 ? formatBytes(size) : "Unknown size",
+    isVideo,
+    isZip,
+    downloadUrl,
+    streamUrl,
+  };
+}
+
+function parseDiskwalaResponse(data: any): ResolvedTeraboxFile[] {
+  const candidates: any[] = [];
+
+  if (Array.isArray(data)) {
+    candidates.push(...data);
+  }
+
+  if (data?.fileInfo) {
+    candidates.push(data.fileInfo);
+  }
+
+  if (Array.isArray(data?.files)) {
+    candidates.push(...data.files);
+  }
+
+  if (Array.isArray(data?.result)) {
+    candidates.push(...data.result);
+  } else if (data?.result && typeof data.result === "object") {
+    candidates.push(data.result);
+  }
+
+  const files: ResolvedTeraboxFile[] = [];
+  const seen = new Set<string>();
+
+  for (let i = 0; i < candidates.length; i++) {
+    const parsed = normalizeDiskwalaFile(candidates[i], i);
+    if (!parsed) continue;
+    const key = \`\${parsed.filename}|\${parsed.downloadUrl || ""}|\${parsed.streamUrl || ""}\`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    files.push(parsed);
+  }
+
+  return files;
+}
+
+async function requestDiskwalaProxy(
+  endpoint: string,
+  normalizedUrl: string,
+  apiKey: string,
+  timeoutMs: number,
+  label: string
+): Promise<ResolvedTeraboxFile[]> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        "x-api-key": apiKey,
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      },
+      body: JSON.stringify({ url: normalizedUrl }),
+      signal: controller.signal,
+    });
+
+    const rawText = await response.text();
+    let data: any = null;
+    try {
+      data = rawText ? JSON.parse(rawText) : null;
+    } catch {
+      data = null;
+    }
+
+    if (!response.ok) {
+      const detail =
+        data?.detail ||
+        data?.message ||
+        data?.error ||
+        (rawText ? rawText.slice(0, 300) : \`HTTP \${response.status}\`);
+      throw new Error(\`\${label} returned HTTP \${response.status}: \${detail}\`);
+    }
+
+    const files = parseDiskwalaResponse(data);
+    if (files.length === 0) {
+      throw new Error(\`\${label} returned no usable direct media URL\`);
+    }
+
+    return files;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function resolveDiskwalaViaPublicPage(normalizedUrl: string, id: string): Promise<ResolvedMetadata | null> {
   const candidateUrls = [
     normalizedUrl,
-    `https://www.diskwala.com/file/${id}`,
-    `https://www.diskwala.com/app/${id}`,
+    \`https://www.diskwala.com/file/\${id}\`,
+    \`https://www.diskwala.com/app/\${id}\`,
   ];
 
-  for (const pageUrl of candidateUrls) {
+  for (const pageUrl of [...new Set(candidateUrls)]) {
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 10000);
       const pageRes = await fetch(pageUrl, {
         headers: {
           "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
           Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         },
         redirect: "follow",
@@ -272,11 +452,26 @@ async function resolveDiskwalaViaPublicPage(normalizedUrl: string, id: string): 
         html.match(/<meta name="title" content="([^"]+)"/i) ||
         html.match(/<title>([^<]+)<\/title>/i);
       const descriptionMatch = html.match(/<meta property="og:description" content="([^"]+)"/i);
-      const directDownloadMatch = html.match(/https?:\/\/[^\s"'<>]+\.(?:mp4|mkv|webm|avi|mov|zip|rar|pdf|mp3|m4a|jpg|jpeg|png)[^\s"'<>]*/i);
-      const rawTitle = titleMatch ? titleMatch[1].trim() : descriptionMatch ? descriptionMatch[1].trim() : `Diskwala_File_${id}`;
-      const fileTitle = rawTitle.replace(/\s*[-|–]\s*DiskWala.*$/i, "").trim() || `Diskwala_File_${id}`;
-      const fileName = cleanFilename(fileTitle || `${id}.bin`);
-      const downloadUrl = directDownloadMatch ? directDownloadMatch[0].replace(/[),.;]+$/, "") : pageUrl;
+      const mediaMatches = html.match(
+        /https?:\/\/[^\s"'<>]+?\.(?:mp4|mkv|webm|avi|mov|m4v|ts|flv|m3u8|zip|rar|7z|pdf|mp3|m4a|jpg|jpeg|png)(?:[^\s"'<>]*)/gi
+      ) || [];
+
+      const directMediaUrl = mediaMatches.find(isUsableHttpUrl);
+      if (!directMediaUrl) continue;
+
+      const rawTitle =
+        titleMatch?.[1]?.trim() ||
+        descriptionMatch?.[1]?.trim() ||
+        \`Diskwala_File_\${id}\`;
+      const fileTitle =
+        rawTitle.replace(/\s*[-|–]\s*DiskWala.*$/i, "").trim() ||
+        \`Diskwala_File_\${id}\`;
+      const fileName = cleanFilename(
+        /\.[a-z0-9]{2,5}$/i.test(fileTitle)
+          ? fileTitle
+          : \`\${fileTitle}.mp4\`
+      );
+      const isVideo = VIDEO_EXTENSIONS.has(path.extname(fileName).toLowerCase());
 
       return {
         title: fileName,
@@ -284,11 +479,11 @@ async function resolveDiskwalaViaPublicPage(normalizedUrl: string, id: string): 
           filename: fileName,
           sizeBytes: 0,
           sizeFormatted: "Unknown size",
-          isVideo: /\.(mp4|mkv|webm|avi|mov|m4v|ts|flv)$/i.test(fileName),
+          isVideo,
           isZip: /\.(zip|rar|7z|tar|gz)$/i.test(fileName),
-          downloadUrl,
+          downloadUrl: directMediaUrl.replace(/[),.;]+$/, ""),
         }],
-        directDownloadPossible: Boolean(downloadUrl),
+        directDownloadPossible: true,
         cookies: undefined,
         refererUrl: pageUrl,
       };
@@ -308,82 +503,130 @@ export async function resolveDiskwalaLink(rawUrl: string): Promise<ResolvedMetad
     throw new Error("Invalid Diskwala URL format. Supported examples: diskwala.com/app/<id>, dw.link/<id>");
   }
 
-  const normalizedUrl = `https://www.diskwala.com/app/${id}`;
-  const headers = {
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    Accept: "application/json,text/html,application/xhtml+xml,*/*",
-    Origin: "https://diskwala.fun",
-    Referer: "https://diskwala.fun/",
-  };
+  const normalizedUrl =
+    /^https?:\/\//i.test(cleanUrl) && /diskwala/i.test(cleanUrl)
+      ? cleanUrl
+      : \`https://www.diskwala.com/app/\${id}\`;
 
+  const failures: string[] = [];
+  const apiKey = process.env.DISKWALA_API_KEY?.trim();
+
+  // Primary path: the scraper-proxy architecture used by the maintained
+  // open-source Diskwala downloader. It returns fileInfo.url and authenticates
+  // using the x-api-key header.
+  const proxyUrl = process.env.DISKWALA_PROXY_URL?.trim();
+  if (proxyUrl && apiKey) {
+    try {
+      const files = await requestDiskwalaProxy(
+        proxyUrl,
+        normalizedUrl,
+        apiKey,
+        600000,
+        "Diskwala proxy"
+      );
+      return {
+        title: files[0].filename,
+        files,
+        directDownloadPossible: files.some((file) => !!file.downloadUrl || !!file.streamUrl),
+        cookies: undefined,
+        refererUrl: normalizedUrl,
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      failures.push(message);
+      console.warn("Diskwala configured proxy failed:", err);
+    }
+  } else {
+    failures.push("DISKWALA_PROXY_URL and/or DISKWALA_API_KEY not configured");
+  }
+
+  // Optional API-compatible path for providers exposing POST
+  // /api/v1/diskwala/extract with the same X-API-Key header.
+  const apiUrl = process.env.DISKWALA_API_URL?.trim();
+  if (apiUrl && apiKey) {
+    try {
+      const files = await requestDiskwalaProxy(
+        apiUrl,
+        normalizedUrl,
+        apiKey,
+        120000,
+        "Diskwala API"
+      );
+      return {
+        title: files[0].filename,
+        files,
+        directDownloadPossible: files.some((file) => !!file.downloadUrl || !!file.streamUrl),
+        cookies: undefined,
+        refererUrl: normalizedUrl,
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      failures.push(message);
+      console.warn("Diskwala configured API failed:", err);
+    }
+  }
+
+  // Compatibility fallback for the existing shared endpoint. Only accept an
+  // actual direct media/HLS URL; never return the Diskwala page as downloadUrl.
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 12000);
+    const timeout = setTimeout(() => controller.abort(), 30000);
     const apiRes = await fetch("https://diskwala.fun/api/resolve", {
       method: "POST",
       headers: {
-        ...headers,
         "Content-Type": "application/json",
+        Accept: "application/json",
+        Origin: "https://diskwala.fun",
+        Referer: "https://diskwala.fun/",
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
       },
       body: JSON.stringify({ url: normalizedUrl }),
       signal: controller.signal,
     });
+
+    const rawText = await apiRes.text();
     clearTimeout(timeout);
 
-    if (apiRes.ok) {
-      const data = await apiRes.json() as any;
-      if (data?.ok && data?.result) {
-        const result = data.result;
-        const fileName = cleanFilename(result.fileName || result.title || `${id}.bin`);
-        const size = Number(result.fileSizeBytes || 0);
-        const downloadUrl = result.downloadUrl || result.streamUrl || result.watchUrl || normalizedUrl;
-        const streamUrl = result.streamUrl || result.watchUrl || result.downloadUrl;
+    let data: any = null;
+    try {
+      data = rawText ? JSON.parse(rawText) : null;
+    } catch {
+      data = null;
+    }
 
-        return {
-          title: result.title || fileName,
-          files: [{
-            filename: fileName,
-            sizeBytes: size,
-            sizeFormatted: formatBytes(size),
-            isVideo: /\.(mp4|mkv|webm|avi|mov|flv|m4v|3gp|ts)$/i.test(fileName),
-            isZip: /\.(zip|rar|7z|tar|gz)$/i.test(fileName),
-            downloadUrl,
-            streamUrl,
-          }],
-          directDownloadPossible: Boolean(downloadUrl || streamUrl),
-          cookies: undefined,
-          refererUrl: "https://diskwala.fun/",
-        };
-      }
+    if (!apiRes.ok) {
+      throw new Error(\`Shared Diskwala resolver returned HTTP \${apiRes.status}\`);
+    }
 
-      if (data?.error === "quota_exceeded") {
-        console.warn("Diskwala shared resolver quota reached, trying public web fallback:", data.message);
-      }
+    const files = parseDiskwalaResponse(data);
+    if (files.length > 0) {
+      return {
+        title: files[0].filename,
+        files,
+        directDownloadPossible: true,
+        cookies: undefined,
+        refererUrl: "https://diskwala.fun/",
+      };
+    }
+
+    if (data?.error === "quota_exceeded") {
+      failures.push(\`Shared Diskwala resolver quota exceeded: \${data.message || "quota exceeded"}\`);
+    } else {
+      failures.push("Shared Diskwala resolver returned no usable direct media URL");
     }
   } catch (err) {
-    console.warn("Diskwala API resolve failed:", err);
+    const message = err instanceof Error ? err.message : String(err);
+    failures.push(message);
+    console.warn("Diskwala shared resolver failed:", err);
   }
 
   const publicPageFallback = await resolveDiskwalaViaPublicPage(normalizedUrl, id);
-  if (publicPageFallback) {
-    return publicPageFallback;
-  }
+  if (publicPageFallback) return publicPageFallback;
 
-  return {
-    title: `Diskwala_File_${id}`,
-    files: [{
-      filename: `Diskwala_File_${id}`,
-      sizeBytes: 0,
-      sizeFormatted: "Unknown size",
-      isVideo: false,
-      isZip: false,
-      downloadUrl: normalizedUrl,
-    }],
-    directDownloadPossible: true,
-    cookies: undefined,
-    refererUrl: normalizedUrl,
-  };
+  throw new Error(
+    \`Diskwala link could not be resolved to a downloadable media URL. \${failures.join(" | ")}\`
+  );
 }
 
 async function fetchTeraboxDownloadUrl(
