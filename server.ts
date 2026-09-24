@@ -692,7 +692,7 @@ async function processDownloadJob(
     const processedFiles: ProcessedFile[] = [];
     const sourceFiles = metadata.files.filter((file) => file.downloadUrl || file.streamUrl);
     if (sourceFiles.length === 0) {
-      throw new Error("No downloadable files were found in this TeraBox link.");
+      throw new Error(isDiskwalaUrl(url) ? "No downloadable files were found in this Diskwala link." : "No downloadable files were found in this TeraBox link.");
     }
     if (sourceFiles.length > MAX_FILES_PER_LINK) {
       throw new Error(`This link contains too many files. The maximum is ${MAX_FILES_PER_LINK}.`);
@@ -870,7 +870,7 @@ async function processDownloadJob(
     }
 
     if (processedFiles.length === 0) {
-      throw new Error("None of the files in this TeraBox link could be downloaded.");
+      throw new Error(isDiskwalaUrl(url) ? "None of the files in this Diskwala link could be downloaded." : "None of the files in this TeraBox link could be downloaded.");
     }
 
     if (failedFiles.length > 0 && chatId && telegramService) {
