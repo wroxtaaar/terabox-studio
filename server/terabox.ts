@@ -495,41 +495,66 @@ async function fetchTeraboxShareList(
   jsToken: string,
   cookieHeader: string,
   refererUrl: string,
-  dir?: string
+  dir?: string,
+  dpLogId?: string
 ): Promise<any[]> {
-  const endpoint = new URL("/share/list", origin);
-  endpoint.searchParams.set("app_id", "250528");
-  endpoint.searchParams.set("web", "1");
-  endpoint.searchParams.set("channel", "dubox");
-  endpoint.searchParams.set("clienttype", "0");
-  endpoint.searchParams.set("jsToken", jsToken);
-  endpoint.searchParams.set("shorturl", shortUrl);
-  endpoint.searchParams.set("page", "1");
-  endpoint.searchParams.set("num", "100");
-  endpoint.searchParams.set("by", "name");
-  endpoint.searchParams.set("order", "asc");
-  if (dir) endpoint.searchParams.set("dir", dir);
-  else endpoint.searchParams.set("root", "1");
+  const origins = [origin, "https://www.terabox.app", "https://www.terabox.com", "https://www.1024tera.com"]
+    .filter(Boolean);
+  const uniqueOrigins = [...new Set(origins)];
+  let lastError = "";
 
-  const response = await fetch(endpoint, {
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-      Accept: "application/json, text/plain, */*",
-      Referer: refererUrl || origin + "/",
-      ...(cookieHeader ? { Cookie: cookieHeader } : {}),
-    },
-  });
-  if (!response.ok) throw new Error("TeraBox share/list returned HTTP " + response.status);
-  const data = (await response.json()) as any;
-  if (Number(data?.errno ?? 0) !== 0) {
-    throw new Error(
-      ("TeraBox share/list failed: errno=" + (data?.errno ?? "unknown") + " " + (data?.errmsg || "")).trim()
-    );
+  for (const apiOrigin of uniqueOrigins) {
+    try {
+      const endpoint = new URL("/share/list", apiOrigin);
+      endpoint.searchParams.set("app_id", "250528");
+      endpoint.searchParams.set("web", "1");
+      endpoint.searchParams.set("channel", "0");
+      endpoint.searchParams.set("clienttype", "0");
+      endpoint.searchParams.set("jsToken", jsToken);
+      endpoint.searchParams.set("shorturl", shortUrl);
+      endpoint.searchParams.set("page", "1");
+      endpoint.searchParams.set("num", "100");
+      endpoint.searchParams.set("by", "name");
+      endpoint.searchParams.set("order", "asc");
+      endpoint.searchParams.set("site_referer", "");
+      if (dpLogId) endpoint.searchParams.set("dp-logid", dpLogId);
+      if (dir) endpoint.searchParams.set("dir", dir);
+      else endpoint.searchParams.set("root", "1");
+
+      const response = await fetch(endpoint, {
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+          Accept: "application/json, text/plain, */*",
+          "Accept-Language": "en-US,en;q=0.9",
+          Referer: refererUrl || apiOrigin + "/",
+          ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+        },
+      });
+
+      if (!response.ok) {
+        lastError = "HTTP " + response.status;
+        continue;
+      }
+
+      const data = (await response.json()) as any;
+      const errno = Number(data?.errno ?? 0);
+      if (errno !== 0) {
+        lastError = "errno=" + errno + " " + (data?.errmsg || "");
+        console.warn(
+          "TeraBox share/list failed on " + apiOrigin + " for shorturl=" + shortUrl + ": " + lastError
+        );
+        continue;
+      }
+      return Array.isArray(data?.list) ? data.list : [];
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+      console.warn("TeraBox share/list request failed on " + apiOrigin + ":", error);
+    }
   }
-  return Array.isArray(data?.list) ? data.list : [];
-}
 
+  throw new Error("TeraBox share/list failed: " + lastError);
+}
 function createTeraboxFileMetadata(
   item: any,
   shareId?: string,
@@ -600,6 +625,10 @@ export async function resolveTeraboxLink(rawUrl: string): Promise<ResolvedMetada
     pageText.match(/fn%28%22([^%"]+)%22%29/i) ||
     pageText.match(/window\.jsToken\s*=\s*["']([^"']+)["']/i);
   const jsToken = jsTokenMatch ? jsTokenMatch[1] : "";
+  const dpLogIdMatch =
+    pageText.match(/dp-logid[=\\"]([^&\\"]+)/i) ||
+    pageText.match(/dpLogId[\\":=]+([0-9]+)/i);
+  const dpLogId = dpLogIdMatch ? dpLogIdMatch[1] : "";
   let apiOrigin = "https://www.terabox.app";
   try {
     const origin = new URL(finalUrl).origin;
@@ -649,7 +678,7 @@ export async function resolveTeraboxLink(rawUrl: string): Promise<ResolvedMetada
 
   if (finalSurl && jsToken) {
     try {
-      const rootItems = await fetchTeraboxShareList(apiOrigin, finalSurl, jsToken, cookieHeader, finalUrl);
+      const rootItems = await fetchTeraboxShareList(apiOrigin, finalSurl, jsToken, cookieHeader, finalUrl, undefined, dpLogId);
       allItems.push(...rootItems);
       const pendingDirs = rootItems.filter((item) => String(item?.isdir ?? "0") === "1");
       const visitedDirs = new Set<string>();
@@ -661,7 +690,7 @@ export async function resolveTeraboxLink(rawUrl: string): Promise<ResolvedMetada
         visitedDirs.add(dirPath);
         foldersScanned++;
         try {
-          const children = await fetchTeraboxShareList(apiOrigin, finalSurl, jsToken, cookieHeader, finalUrl, dirPath);
+          const children = await fetchTeraboxShareList(apiOrigin, finalSurl, jsToken, cookieHeader, finalUrl, dirPath, dpLogId);
           allItems.push(...children);
           for (const child of children) {
             if (String(child?.isdir ?? "0") === "1") pendingDirs.push(child);
@@ -725,6 +754,8 @@ export async function resolveTeraboxLink(rawUrl: string): Promise<ResolvedMetada
       "uk=" + (uk ? "yes" : "no"),
       "sign=" + (sign ? "yes" : "no"),
       "timestamp=" + (timestamp ? "yes" : "no"),
+      "dpLogId=" + (dpLogId ? "yes" : "no"),
+      "finalHost=" + (() => { try { return new URL(finalUrl).host; } catch { return "unknown"; } })(),
     ].join(", ");
     throw new Error("No downloadable files were found in this TeraBox link (" + diagnostic + ").");
   }
