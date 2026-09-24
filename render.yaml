@@ -17,3 +17,9 @@ services:
         value: /app/data
       - key: MAX_QUEUE_SIZE
         value: "100"
+      - key: DISKWALA_PROXY_URL
+        sync: false
+      - key: DISKWALA_API_KEY
+        sync: false
+      - key: DISKWALA_API_URL
+        sync: false
