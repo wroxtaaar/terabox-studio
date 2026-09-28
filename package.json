@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "tsx server.ts",
     "build": "esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
-    "start": "node dist/server.cjs"
+    "start": "node dist/server.cjs",
+    "prebuild": "node scripts/patch-terabox-chromium.mjs"
   },
   "dependencies": {
     "express": "^4.21.2",
