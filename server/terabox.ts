@@ -4,6 +4,7 @@ import { pipeline } from "stream/promises";
 import unzipper from "unzipper";
 import { execFile } from "child_process";
 import { promisify } from "util";
+import { chromium } from "playwright-core";
 
 const execFileAsync = promisify(execFile);
 
@@ -561,6 +562,259 @@ async function resolveTeraboxViaProxy(rawUrl: string): Promise<ResolvedMetadata 
   );
 }
 
+
+let browserResolverInProgress = false;
+
+function getChromiumExecutablePath(): string {
+  return (
+    process.env.TERABOX_CHROMIUM_PATH?.trim() ||
+    process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH?.trim() ||
+    "/usr/bin/chromium"
+  );
+}
+
+async function resolveTeraboxViaChromium(rawUrl: string): Promise<ResolvedMetadata> {
+  if (browserResolverInProgress) {
+    throw new Error("Chromium resolver is already busy.");
+  }
+
+  const shortCode = extractSurl(rawUrl);
+  if (!shortCode) {
+    throw new Error("Could not extract a TeraBox share code for Chromium resolution.");
+  }
+
+  browserResolverInProgress = true;
+  let browser: Awaited<ReturnType<typeof chromium.launch>> | null = null;
+
+  try {
+    browser = await chromium.launch({
+      executablePath: getChromiumExecutablePath(),
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-software-rasterizer",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-background-timer-throttling",
+        "--disable-renderer-backgrounding",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-features=Translate,BackForwardCache",
+      ],
+      timeout: 15000,
+    });
+
+    const context = await browser.newContext({
+      userAgent:
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      locale: "en-US",
+      viewport: { width: 1280, height: 720 },
+      serviceWorkers: "allow",
+    });
+
+    const page = await context.newPage();
+    page.setDefaultTimeout(10000);
+    console.log("Chromium resolver: opening TeraBox share page");
+
+    await page.goto(rawUrl, {
+      waitUntil: "domcontentloaded",
+      timeout: 20000,
+    });
+    await page.waitForTimeout(2500);
+
+    const finalUrl = page.url();
+    const pageText = await page.content();
+    const jsTokenMatch =
+      pageText.match(/fn\("([A-F0-9]+)"\)/i) ||
+      pageText.match(/fn%28%22([^%"]+)%22%29/i) ||
+      pageText.match(/window\.jsToken\s*=\s*["']([^"']+)["']/i);
+    const jsToken = jsTokenMatch?.[1] || "";
+
+    const browserCookies = await context.cookies();
+    const cookieHeader = browserCookies
+      .map((cookie) => cookie.name + "=" + cookie.value)
+      .join("; ");
+
+    let apiOrigin = "https://www.terabox.app";
+    try {
+      const origin = new URL(finalUrl).origin;
+      if (origin.includes("terabox")) apiOrigin = origin;
+    } catch {}
+
+    const browserData = await page.evaluate(
+      async ({ origin, shortCode, jsToken }) => {
+        const variants = [
+          shortCode,
+          shortCode.startsWith("1") ? shortCode.slice(1) : "1" + shortCode,
+        ].filter((value, index, values) => value && values.indexOf(value) === index);
+
+        const result: {
+          info: any | null;
+          list: any[];
+          errors: string[];
+        } = { info: null, list: [], errors: [] };
+
+        for (const variant of variants) {
+          try {
+            const infoUrl = new URL("/api/shorturlinfo", origin);
+            infoUrl.searchParams.set("app_id", "250528");
+            infoUrl.searchParams.set("shorturl", variant);
+            infoUrl.searchParams.set("root", "1");
+            infoUrl.searchParams.set("web", "1");
+            infoUrl.searchParams.set("channel", "dubox");
+            infoUrl.searchParams.set("clienttype", "0");
+            if (jsToken) infoUrl.searchParams.set("jsToken", jsToken);
+
+            const response = await fetch(infoUrl.toString(), {
+              credentials: "include",
+              headers: {
+                Accept: "application/json, text/plain, */*",
+                "X-Requested-With": "XMLHttpRequest",
+              },
+            });
+            const text = await response.text();
+            let payload: any = null;
+            try { payload = text ? JSON.parse(text) : null; } catch {}
+
+            if (response.ok && Number(payload?.errno ?? 0) === 0 && Array.isArray(payload?.list)) {
+              result.info = payload;
+              break;
+            }
+
+            result.errors.push(
+              "shorturlinfo " + variant + " HTTP " + response.status +
+              " errno=" + String(payload?.errno ?? "unknown")
+            );
+          } catch (error) {
+            result.errors.push(
+              "shorturlinfo " + variant + ": " +
+              (error instanceof Error ? error.message : String(error))
+            );
+          }
+        }
+
+        const shareShortUrl =
+          result.info?.shorturl ||
+          result.info?.shorturlinfo?.shorturl ||
+          variants[0] ||
+          shortCode;
+
+        try {
+          const listUrl = new URL("/share/list", origin);
+          listUrl.searchParams.set("app_id", "250528");
+          listUrl.searchParams.set("web", "1");
+          listUrl.searchParams.set("channel", "0");
+          listUrl.searchParams.set("clienttype", "0");
+          if (jsToken) listUrl.searchParams.set("jsToken", jsToken);
+          listUrl.searchParams.set("shorturl", shareShortUrl);
+          listUrl.searchParams.set("page", "1");
+          listUrl.searchParams.set("num", "100");
+          listUrl.searchParams.set("by", "name");
+          listUrl.searchParams.set("order", "asc");
+          listUrl.searchParams.set("root", "1");
+
+          const response = await fetch(listUrl.toString(), {
+            credentials: "include",
+            headers: {
+              Accept: "application/json, text/plain, */*",
+              "X-Requested-With": "XMLHttpRequest",
+            },
+          });
+          const text = await response.text();
+          let payload: any = null;
+          try { payload = text ? JSON.parse(text) : null; } catch {}
+
+          if (response.ok && Number(payload?.errno ?? 0) === 0 && Array.isArray(payload?.list)) {
+            result.list = payload.list;
+          } else {
+            result.errors.push(
+              "share/list HTTP " + response.status +
+              " errno=" + String(payload?.errno ?? "unknown")
+            );
+          }
+        } catch (error) {
+          result.errors.push(
+            "share/list: " + (error instanceof Error ? error.message : String(error))
+          );
+        }
+
+        return result;
+      },
+      { origin: apiOrigin, shortCode, jsToken }
+    );
+
+    const info = browserData.info;
+    const rawItems = [
+      ...(Array.isArray(info?.list) ? info.list : []),
+      ...(Array.isArray(browserData.list) ? browserData.list : []),
+    ];
+
+    const uniqueItems = new Map<string, any>();
+    for (const item of rawItems) {
+      const key = item?.fs_id
+        ? "fs:" + item.fs_id
+        : "path:" + (item?.path || item?.server_filename || item?.filename || JSON.stringify(item));
+      if (!uniqueItems.has(key)) uniqueItems.set(key, item);
+    }
+
+    const shareId = info?.shareid ? String(info.shareid) : undefined;
+    const uk = info?.uk ? String(info.uk) : undefined;
+    const sign = info?.sign ? String(info.sign) : undefined;
+    const timestamp = info?.timestamp ? String(info.timestamp) : undefined;
+    const randsk = info?.randsk ? decodeURIComponent(String(info.randsk)) : undefined;
+    const files: ResolvedTeraboxFile[] = [];
+
+    for (const item of uniqueItems.values()) {
+      const file = createTeraboxFileMetadata(item, shareId, uk, sign, timestamp);
+      if (file) files.push(file);
+    }
+
+    if (shareId && uk && sign && timestamp) {
+      for (const file of files) {
+        if (file.downloadUrl || !file.fsId) continue;
+        file.downloadUrl = await fetchTeraboxDownloadUrl(
+          shareId, uk, sign, timestamp, file.fsId, jsToken, cookieHeader, finalUrl
+        );
+      }
+    }
+
+    const downloadableFiles = files.filter((file) => file.downloadUrl || file.streamUrl);
+    if (downloadableFiles.length === 0) {
+      throw new Error(
+        "Chromium resolver found no downloadable files (jsToken=" +
+        (jsToken ? "yes" : "no") + "; items=" + uniqueItems.size + "; " +
+        browserData.errors.join(" | ") + ")"
+      );
+    }
+
+    console.log(
+      "Chromium resolver succeeded: files=" + downloadableFiles.length +
+      " cookies=" + (cookieHeader ? "yes" : "no")
+    );
+
+    return {
+      shareId,
+      uk,
+      sign,
+      timestamp,
+      randsk,
+      title: info?.title
+        ? cleanFilename(String(info.title))
+        : downloadableFiles[0]?.filename || "TeraBox Files",
+      files: downloadableFiles,
+      directDownloadPossible: true,
+      cookies: cookieHeader,
+      refererUrl: finalUrl,
+    };
+  } finally {
+    try { await browser?.close(); } catch {}
+    browserResolverInProgress = false;
+  }
+}
+
 export async function resolveTeraboxLink(rawUrl: string): Promise<ResolvedMetadata> {
   const cleanUrl = rawUrl.trim();
   const shortCode = extractSurl(cleanUrl);
@@ -788,6 +1042,15 @@ export async function resolveTeraboxLink(rawUrl: string): Promise<ResolvedMetada
       }
     } catch (proxyError) {
       console.warn("TeraBox proxy fallback failed:", proxyError);
+    }
+  }
+
+  if (downloadableFiles.length === 0) {
+    try {
+      const chromiumMetadata = await resolveTeraboxViaChromium(cleanUrl);
+      if (chromiumMetadata?.files?.length) return chromiumMetadata;
+    } catch (chromiumError) {
+      console.warn("TeraBox Chromium fallback failed:", chromiumError);
     }
   }
 
