@@ -270,26 +270,21 @@ export class TelegramService {
     }
   }
 
-  async setWebhook(url: string, secretToken?: string): Promise<boolean> {
-    const body: Record<string, unknown> = {
-      url,
-      allowed_updates: ["message", "callback_query"],
-    };
-    if (secretToken) body.secret_token = secretToken;
-    const res = await fetch(`${this.apiBaseUrl}/setWebhook`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    const data = (await res.json()) as any;
-    if (!data.ok) throw new Error(data.description || "Failed to set Telegram webhook");
-    return true;
+  async getUpdates(offset: number = 0, timeout: number = 10): Promise<TelegramUpdate[]> {
+    try {
+      const res = await fetch(
+        `${this.apiBaseUrl}/getUpdates?offset=${offset}&timeout=${timeout}`,
+        {
+          method: "GET",
+        }
+      );
+      const data = (await res.json()) as any;
+      if (data.ok && Array.isArray(data.result)) {
+        return data.result;
+      }
+      return [];
+    } catch {
+      return [];
+    }
   }
-
-  async deleteWebhook(): Promise<boolean> {
-    const res = await fetch(`${this.apiBaseUrl}/deleteWebhook`, { method: "POST" });
-    const data = (await res.json()) as any;
-    return !!data.ok;
-  }
-
 }

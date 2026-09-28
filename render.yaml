@@ -5,13 +5,17 @@ services:
     plan: free
     healthCheckPath: /api/health
     envVars:
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
       - key: TELEGRAM_BOT_TOKEN
         sync: false
-      - key: TELEGRAM_WEBHOOK_SECRET
+      - key: APP_URL
         sync: false
       - key: TERABOX_COOKIE_HEADER
         sync: false
       - key: DATA_DIR
         value: /app/data
       - key: MAX_QUEUE_SIZE
-        value: "10"
+        value: "100"

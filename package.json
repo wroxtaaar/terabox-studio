@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "express": "^4.21.2",
+    "telegram": "^2.26.22",
     "unzipper": "^0.12.5"
   },
   "devDependencies": {
