@@ -104,6 +104,7 @@ async function resolveTeraboxViaChromium(rawUrl: string): Promise<ResolvedMetada
       const capturedItems: any[] = [];
       const networkErrors: string[] = [];
       const responseSummary: string[] = [];
+      const pendingResponses: Promise<void>[] = [];
 
       const consumeResponse = async (response: any) => {
         const url = response.url();
@@ -135,13 +136,27 @@ async function resolveTeraboxViaChromium(rawUrl: string): Promise<ResolvedMetada
             return;
           }
 
-          if (lower.includes("/api/shorturlinfo") && Number(payload?.errno ?? -1) === 0) {
-            capturedInfo = payload;
-            if (Array.isArray(payload?.list)) capturedItems.push(...payload.list);
+          if (lower.includes("/api/shorturlinfo")) {
+            const errno = Number(payload?.errno ?? -1);
+            console.log(
+              "Chromium shorturlinfo response status=" + response.status() +
+              " errno=" + errno +
+              " items=" + (Array.isArray(payload?.list) ? payload.list.length : 0)
+            );
+            if (errno === 0) {
+              capturedInfo = payload;
+              if (Array.isArray(payload?.list)) capturedItems.push(...payload.list);
+            }
           }
 
-          if (lower.includes("/share/list") && Number(payload?.errno ?? -1) === 0) {
-            if (Array.isArray(payload?.list)) capturedItems.push(...payload.list);
+          if (lower.includes("/share/list")) {
+            const errno = Number(payload?.errno ?? -1);
+            console.log(
+              "Chromium share/list response status=" + response.status() +
+              " errno=" + errno +
+              " items=" + (Array.isArray(payload?.list) ? payload.list.length : 0)
+            );
+            if (errno === 0 && Array.isArray(payload?.list)) capturedItems.push(...payload.list);
           }
 
           if (Array.isArray(payload?.dlink)) {
@@ -165,7 +180,10 @@ async function resolveTeraboxViaChromium(rawUrl: string): Promise<ResolvedMetada
       });
 
       page.on("response", (response: any) => {
-        void consumeResponse(response);
+        const pending = consumeResponse(response).catch((error) => {
+          networkErrors.push("response-handler: " + (error instanceof Error ? error.message : String(error)));
+        });
+        pendingResponses.push(pending);
       });
 
       page.on("requestfailed", (request: any) => {
@@ -251,7 +269,10 @@ async function resolveTeraboxViaChromium(rawUrl: string): Promise<ResolvedMetada
           if (token) jsToken ||= token;
         });
         apiPage.on("response", (response: any) => {
-          void consumeResponse(response);
+          const pending = consumeResponse(response).catch((error) => {
+            networkErrors.push("api-response-handler: " + (error instanceof Error ? error.message : String(error)));
+          });
+          pendingResponses.push(pending);
         });
 
         const variants = [
@@ -280,6 +301,12 @@ async function resolveTeraboxViaChromium(rawUrl: string): Promise<ResolvedMetada
         }
 
         await apiPage.close().catch(() => {});
+      }
+
+      // Response events are asynchronous. Wait for every captured API body
+      // before converting the captured payloads into files.
+      if (pendingResponses.length > 0) {
+        await Promise.allSettled(pendingResponses);
       }
 
       const allItems = [...capturedItems];
