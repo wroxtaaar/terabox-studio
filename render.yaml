@@ -13,7 +13,6 @@ services:
         sync: false
       - key: APP_URL
         sync: false
-      - key: TERABOX_COOKIE_HEADER
         sync: false
       - key: DATA_DIR
         value: /app/data
