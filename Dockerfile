@@ -17,6 +17,7 @@ RUN apt-get update \
 WORKDIR /app
 ENV NODE_ENV=production
 ENV DATA_DIR=/app/data
+ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
 COPY package*.json ./
 RUN npm install --omit=dev \
