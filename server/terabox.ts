@@ -641,10 +641,10 @@ async function resolveTeraboxViaChromium(rawUrl: string): Promise<ResolvedMetada
           ].join("\\n");
 
           const tokenPatterns: Array<[string, RegExp]> = [
-            ["jsToken", /(?:window\\.)?jsToken\\s*[=:]\\s*["']([^"']+)["']/i],
-            ["jsTokenFn", /fn\\(["']([A-F0-9]+)["']\\)/i],
-            ["dpLogId", /(?:dp-logid|dpLogId)\\s*[=:]\\s*["']?([0-9]+)/i],
-            ["bdstoken", /(?:bdstoken|bdstoken)\\s*[=:]\\s*["']([^"']+)["']/i],
+            ["jsToken", /(?:window\.)?jsToken\s*[=:]\s*["']([^"']+)["']/i],
+            ["jsTokenFn", /fn\(["']([A-F0-9]+)["']\)/i],
+            ["dpLogId", /(?:dp-logid|dpLogId)\s*[=:]\s*["']?([0-9]+)/i],
+            ["bdstoken", /bdstoken\s*[=:]\s*["']([^"']+)["']/i],
           ];
 
           for (const [name, pattern] of tokenPatterns) {
