@@ -526,7 +526,7 @@ async function resolveTeraboxViaChromium(rawUrl: string): Promise<ResolvedMetada
 
       page.on("download", (download) => {
         const url = download.url();
-        if (url && /^https?:\/\/i.test(url) && !downloadUrls.includes(url)) {
+        if (url && /^https?:\/\//i.test(url) && !downloadUrls.includes(url)) {
           downloadUrls.push(url);
           console.log("Chromium browser download captured:", url.slice(0, 320));
         }
