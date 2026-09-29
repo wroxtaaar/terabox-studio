@@ -4,22 +4,13 @@ import { pipeline } from "stream/promises";
 import unzipper from "unzipper";
 import { execFile } from "child_process";
 import { promisify } from "util";
-import { chromium } from "playwright-core";
+import { chromium, type Browser, type Page } from "playwright-core";
 
 const execFileAsync = promisify(execFile);
 
 export const VIDEO_EXTENSIONS = new Set([
-  ".mp4",
-  ".mkv",
-  ".webm",
-  ".mov",
-  ".avi",
-  ".m4v",
-  ".mpeg",
-  ".mpg",
-  ".3gp",
-  ".ts",
-  ".flv",
+  ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v",
+  ".mpeg", ".mpg", ".3gp", ".ts", ".flv",
 ]);
 
 export const TERABOX_DOMAINS_PATTERN =
@@ -28,146 +19,58 @@ export const TERABOX_DOMAINS_PATTERN =
 export function isTeraboxUrl(text: string): boolean {
   if (!text) return false;
   if (TERABOX_DOMAINS_PATTERN.test(text)) return true;
-  if (
-    /(?:\/s\/|\/share\/init|\/sharing\/link)\?.*?(?:surl=|s\/1)[a-zA-Z0-9_-]+|\/s\/1[a-zA-Z0-9_-]{10,}/i.test(
-      text
-    )
-  ) {
-    return true;
-  }
-  return false;
+  return /(?:\/s\/|\/share\/init|\/sharing\/link)\?.*?(?:surl=|s\/1)[a-zA-Z0-9_-]+|\/s\/1[a-zA-Z0-9_-]{10,}/i.test(text);
 }
 
 export function extractUrlFromText(text: string): string | null {
-  const match = text.match(/https?:\/\/\S+/i);
-  if (match) return match[0].replace(/[).,\]]+$/, "");
-  const match2 = text.match(/(?:www\.)?[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\/\S+/i);
-  if (match2) return "https://" + match2[0].replace(/^[a-z]+:\/\//i, "").replace(/[).,\]]+$/, "");
-  return null;
+  const direct = text.match(/https?:\/\/\S+/i);
+  if (direct) return direct[0].replace(/[).,\]]+$/, "");
+  const bare = text.match(/(?:www\.)?[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\/\S+/i);
+  return bare ? "https://" + bare[0].replace(/^[a-z]+:\/\//i, "").replace(/[).,\]]+$/, "") : null;
 }
 
 export function cleanFilename(filename: string): string {
   if (!filename) return "terabox_download";
-  try {
-    filename = decodeURIComponent(filename);
-  } catch {
-    // ignore decode error
-  }
+  try { filename = decodeURIComponent(filename); } catch {}
   filename = path.basename(filename);
-  filename = filename.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_");
-  filename = filename.trim().replace(/^[. ]+|[. ]+$/g, "");
+  filename = filename.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").trim().replace(/^[. ]+|[. ]+$/g, "");
   return filename || "terabox_download";
 }
 
 export function formatBytes(bytes: number): string {
-  if (bytes === 0) return "0 B";
-  const k = 1024;
+  if (!bytes) return "0 B";
+  const i = Math.min(4, Math.floor(Math.log(bytes) / Math.log(1024)));
   const sizes = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
+  return parseFloat((bytes / Math.pow(1024, i)).toFixed(2)) + " " + sizes[i];
 }
 
 export function detectExtensionFromBuffer(buffer: Buffer): string | null {
   if (!buffer || buffer.length < 12) return null;
-
-  // ftyp -> mp4 or mov
-  if (buffer.length >= 12 && buffer.subarray(4, 8).toString("ascii") === "ftyp") {
-    const brand = buffer.subarray(8, 12).toString("ascii");
-    if (brand === "qt  " || brand === "moov") return ".mov";
-    return ".mp4";
+  if (buffer.subarray(4, 8).toString("ascii") === "ftyp") return ".mp4";
+  if (buffer[0] === 0x1a && buffer[1] === 0x45 && buffer[2] === 0xdf && buffer[3] === 0xa3) {
+    return buffer.subarray(0, 128).toString("binary").toLowerCase().includes("webm") ? ".webm" : ".mkv";
   }
-
-  // Matroska / WebM
-  if (
-    buffer[0] === 0x1a &&
-    buffer[1] === 0x45 &&
-    buffer[2] === 0xdf &&
-    buffer[3] === 0xa3
-  ) {
-    const textHeader = buffer.subarray(0, 64).toString("binary");
-    if (textHeader.includes("webm")) return ".webm";
-    return ".mkv";
-  }
-
-  // AVI
-  if (
-    buffer.subarray(0, 4).toString("ascii") === "RIFF" &&
-    buffer.subarray(8, 12).toString("ascii") === "AVI "
-  ) {
-    return ".avi";
-  }
-
-  // MP3
-  if (
-    buffer.subarray(0, 3).toString("ascii") === "ID3" ||
-    (buffer[0] === 0xff && (buffer[1] === 0xfb || buffer[1] === 0xf3 || buffer[1] === 0xf2))
-  ) {
-    return ".mp3";
-  }
-
-  // ZIP
-  if (buffer[0] === 0x50 && buffer[1] === 0x4b && buffer[2] === 0x03 && buffer[3] === 0x04) {
-    return ".zip";
-  }
-
-  // RAR
-  if (
-    buffer.subarray(0, 4).toString("ascii") === "Rar!" &&
-    buffer[4] === 0x1a &&
-    buffer[5] === 0x07
-  ) {
-    return ".rar";
-  }
-
-  // 7z
-  if (
-    buffer[0] === 0x37 &&
-    buffer[1] === 0x7a &&
-    buffer[2] === 0xbc &&
-    buffer[3] === 0xaf &&
-    buffer[4] === 0x27 &&
-    buffer[5] === 0x1c
-  ) {
-    return ".7z";
-  }
-
-  // PDF
-  if (buffer.subarray(0, 4).toString("ascii") === "%PDF") {
-    return ".pdf";
-  }
-
-  // JPEG
-  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
-    return ".jpg";
-  }
-
-  // PNG
-  if (
-    buffer[0] === 0x89 &&
-    buffer[1] === 0x50 &&
-    buffer[2] === 0x4e &&
-    buffer[3] === 0x47 &&
-    buffer[4] === 0x0d &&
-    buffer[5] === 0x0a &&
-    buffer[6] === 0x1a &&
-    buffer[7] === 0x0a
-  ) {
-    return ".png";
-  }
-
+  if (buffer.subarray(0, 4).toString("ascii") === "RIFF" && buffer.subarray(8, 12).toString("ascii") === "AVI ") return ".avi";
+  if (buffer.subarray(0, 3).toString("ascii") === "ID3" || (buffer[0] === 0xff && [0xfb,0xf3,0xf2].includes(buffer[1]))) return ".mp3";
+  if (buffer[0] === 0x50 && buffer[1] === 0x4b && buffer[2] === 0x03 && buffer[3] === 0x04) return ".zip";
+  if (buffer.subarray(0, 4).toString("ascii") === "Rar!" && buffer[4] === 0x1a && buffer[5] === 0x07) return ".rar";
+  if (buffer[0] === 0x37 && buffer[1] === 0x7a && buffer[2] === 0xbc && buffer[3] === 0xaf && buffer[4] === 0x27 && buffer[5] === 0x1c) return ".7z";
+  if (buffer.subarray(0, 4).toString("ascii") === "%PDF") return ".pdf";
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return ".jpg";
+  if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47) return ".png";
   return null;
 }
 
 export function extractSurl(rawUrl: string): string | null {
   try {
-    const urlObj = new URL(rawUrl);
-    const surlParam = urlObj.searchParams.get("surl");
-    if (surlParam) return surlParam;
+    const u = new URL(rawUrl);
+    const value = u.searchParams.get("surl");
+    if (value) return value;
     const match = rawUrl.match(/\/s\/([a-zA-Z0-9_-]+)/i);
     if (match) return match[1];
   } catch {
-    const m = rawUrl.match(/(?:surl=|s\/)([a-zA-Z0-9_-]+)/i);
-    if (m) return m[1];
+    const match = rawUrl.match(/(?:surl=|s\/)([a-zA-Z0-9_-]+)/i);
+    if (match) return match[1];
   }
   return null;
 }
@@ -201,896 +104,524 @@ export interface ResolvedMetadata {
   refererUrl?: string;
 }
 
-async function fetchTeraboxDownloadUrl(
-  shareId: string,
-  uk: string,
-  sign: string,
-  timestamp: string,
-  fsId: string,
-  jsToken: string,
-  cookieHeader: string,
-  refererUrl: string
-): Promise<string | undefined> {
-  const origins = [
-    (() => {
-      try {
-        const origin = new URL(refererUrl).origin;
-        return origin.includes("terabox") ? origin : "https://www.terabox.app";
-      } catch {
-        return "https://www.terabox.app";
-      }
-    })(),
-    "https://www.terabox.app",
-    "https://www.terabox.com",
-    "https://www.1024terabox.com",
-  ];
-  const uniqueOrigins = [...new Set(origins)];
+let chromiumQueue: Promise<void> = Promise.resolve();
 
-  for (const origin of uniqueOrigins) {
-    try {
-      const endpoint = new URL("/share/download", origin);
-      endpoint.searchParams.set("app_id", "250528");
-      endpoint.searchParams.set("web", "1");
-      endpoint.searchParams.set("channel", "dubox");
-      endpoint.searchParams.set("clienttype", "0");
-      if (jsToken) endpoint.searchParams.set("jsToken", jsToken);
-      endpoint.searchParams.set("shareid", shareId);
-      endpoint.searchParams.set("sign", sign);
-      endpoint.searchParams.set("timestamp", timestamp);
-
-      const body = new URLSearchParams({
-        product: "share",
-        nozip: "0",
-        fid_list: "[" + fsId + "]",
-        uk,
-        primaryid: shareId,
-      });
-
-      const response = await fetch(endpoint, {
-        method: "POST",
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-          Accept: "application/json, text/plain, */*",
-          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-          Referer: refererUrl || origin + "/",
-          ...(cookieHeader ? { Cookie: cookieHeader } : {}),
-        },
-        body,
-      });
-
-      if (!response.ok) {
-        console.warn("TeraBox share/download returned HTTP " + response.status + " from " + origin);
-        continue;
-      }
-
-      const data = (await response.json()) as any;
-      if (data?.errno !== undefined && Number(data.errno) !== 0) {
-        console.warn(
-          "TeraBox share/download failed for fs_id=" + fsId + ": errno=" + data.errno + " " + (data.errmsg || "")
-        );
-        continue;
-      }
-
-      const dlink = Array.isArray(data?.dlink) ? data.dlink[0] : data?.dlink;
-      if (!dlink || typeof dlink !== "string") continue;
-
-      try {
-        const redirectResponse = await fetch(dlink, {
-          method: "GET",
-          redirect: "manual",
-          headers: {
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            Referer: refererUrl || origin + "/",
-            ...(cookieHeader ? { Cookie: cookieHeader } : {}),
-          },
-        });
-        const location = redirectResponse.headers.get("location");
-        if (location) return new URL(location, dlink).toString();
-        if (redirectResponse.ok) return dlink;
-      } catch (redirectError) {
-        console.warn("Could not resolve TeraBox download redirect for fs_id=" + fsId + ":", redirectError);
-        return dlink;
-      }
-    } catch (error) {
-      console.warn("TeraBox share/download request failed for fs_id=" + fsId + ":", error);
-    }
-  }
-  return undefined;
+async function withChromiumSlot<T>(fn: () => Promise<T>): Promise<T> {
+  let release!: () => void;
+  const previous = chromiumQueue;
+  chromiumQueue = new Promise<void>((resolve) => { release = resolve; });
+  await previous;
+  try { return await fn(); }
+  finally { release(); }
 }
 
-async function fetchTeraboxShareList(
-  origin: string,
-  shortUrl: string,
-  jsToken: string,
-  cookieHeader: string,
-  refererUrl: string,
-  dir?: string,
-  dpLogId?: string
-): Promise<any[]> {
-  const origins = [origin, "https://www.terabox.app", "https://www.terabox.com", "https://www.1024tera.com"]
-    .filter(Boolean);
-  const uniqueOrigins = [...new Set(origins)];
-  let lastError = "";
-
-  for (const apiOrigin of uniqueOrigins) {
-    try {
-      const endpoint = new URL("/share/list", apiOrigin);
-      endpoint.searchParams.set("app_id", "250528");
-      endpoint.searchParams.set("web", "1");
-      endpoint.searchParams.set("channel", "0");
-      endpoint.searchParams.set("clienttype", "0");
-      endpoint.searchParams.set("jsToken", jsToken);
-      endpoint.searchParams.set("shorturl", shortUrl);
-      endpoint.searchParams.set("page", "1");
-      endpoint.searchParams.set("num", "100");
-      endpoint.searchParams.set("by", "name");
-      endpoint.searchParams.set("order", "asc");
-      endpoint.searchParams.set("site_referer", "");
-      if (dpLogId) endpoint.searchParams.set("dp-logid", dpLogId);
-      if (dir) endpoint.searchParams.set("dir", dir);
-      else endpoint.searchParams.set("root", "1");
-
-      const response = await fetch(endpoint, {
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-          Accept:
-            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-          "Accept-Language": "en-US,en;q=0.9,hi;q=0.8",
-          "Sec-Fetch-Dest": "document",
-          "Sec-Fetch-Mode": "navigate",
-          "Sec-Fetch-Site": "same-origin",
-          "Sec-Fetch-User": "?1",
-          "Upgrade-Insecure-Requests": "1",
-          "X-Requested-With": "XMLHttpRequest",
-          Referer: refererUrl || apiOrigin + "/",
-          ...(cookieHeader ? { Cookie: cookieHeader } : {}),
-        },
-      });
-
-      if (!response.ok) {
-        lastError = "HTTP " + response.status;
-        continue;
-      }
-
-      const data = (await response.json()) as any;
-      const errno = Number(data?.errno ?? 0);
-      if (errno !== 0) {
-        lastError = "errno=" + errno + " " + (data?.errmsg || "");
-        console.warn(
-          "TeraBox share/list failed on " + apiOrigin + " for shorturl=" + shortUrl + ": " + lastError
-        );
-        continue;
-      }
-      return Array.isArray(data?.list) ? data.list : [];
-    } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error);
-      console.warn("TeraBox share/list request failed on " + apiOrigin + ":", error);
-    }
-  }
-
-  throw new Error("TeraBox share/list failed: " + lastError);
+function chromiumPath(): string {
+  return process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH?.trim()
+    || process.env.TERABOX_CHROMIUM_PATH?.trim()
+    || "/usr/bin/chromium";
 }
-function createTeraboxFileMetadata(
-  item: any,
-  shareId?: string,
-  uk?: string,
-  sign?: string,
-  timestamp?: string
-): ResolvedTeraboxFile | null {
-  if (String(item?.isdir ?? "0") === "1") return null;
-  const filename = cleanFilename(item?.server_filename || item?.filename || "file");
-  const size = Number.parseInt(String(item?.size ?? "0"), 10) || 0;
+
+function isInterestingUrl(url: string): boolean {
+  return /(?:terabox|terashare|1024tera|dubox)/i.test(url) &&
+    /(?:api\/|share\/|download|stream|file|list|dlink|shorturl)/i.test(url);
+}
+
+function valueAsString(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  const text = String(value).trim();
+  return text || undefined;
+}
+
+function mergeFile(
+  files: Map<string, ResolvedTeraboxFile>,
+  file: ResolvedTeraboxFile
+): void {
+  const key = file.fsId ? "fs:" + file.fsId : "file:" + file.filename + ":" + file.sizeBytes;
+  const previous = files.get(key);
+  files.set(key, {
+    ...previous,
+    ...file,
+    downloadUrl: file.downloadUrl || previous?.downloadUrl,
+    streamUrl: file.streamUrl || previous?.streamUrl,
+  });
+}
+
+function fileFromObject(item: any, metadata: Partial<ResolvedMetadata>): ResolvedTeraboxFile | null {
+  if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+  if (String(item.isdir ?? item.isDir ?? "0") === "1") return null;
+
+  const filename = cleanFilename(
+    valueAsString(item.server_filename) ||
+    valueAsString(item.filename) ||
+    valueAsString(item.name) ||
+    ""
+  );
+
+  const hasIdentity =
+    !!item.fs_id || !!item.fsId ||
+    item.size !== undefined ||
+    !!item.dlink || !!item.download_url ||
+    (typeof item.url === "string" && /(?:download|dlink|m3u8|streaming)/i.test(item.url));
+
+  if (!hasIdentity || filename === "terabox_download") return null;
+
+  const size = Number(item.size ?? item.sizeBytes ?? 0) || 0;
   const ext = path.extname(filename).toLowerCase();
-  let streamUrl: string | undefined;
-  if (shareId && uk && sign && timestamp && item?.fs_id) {
-    streamUrl = "https://www.terabox.app/share/streaming?app_id=250528&web=1&channel=dubox&clienttype=0&shareid=" +
-      shareId + "&uk=" + uk + "&fid=" + item.fs_id + "&sign=" + encodeURIComponent(sign) +
-      "&timestamp=" + timestamp + "&type=M3U8_AUTO_480";
+
+  let downloadUrl =
+    valueAsString(item.dlink) ||
+    valueAsString(item.download_url);
+
+  let streamUrl =
+    valueAsString(item.m3u8) ||
+    valueAsString(item.stream_url);
+
+  if (!streamUrl && typeof item.url === "string" && /(?:m3u8|streaming)/i.test(item.url)) {
+    streamUrl = item.url;
   }
+
+  // The URL is built only from metadata observed inside the real browser session.
+  if (!streamUrl && metadata.shareId && metadata.uk && metadata.sign && metadata.timestamp && (item.fs_id || item.fsId) && VIDEO_EXTENSIONS.has(ext)) {
+    streamUrl =
+      "https://www.terabox.app/share/streaming?app_id=250528&web=1&channel=dubox&clienttype=0" +
+      "&shareid=" + encodeURIComponent(metadata.shareId) +
+      "&uk=" + encodeURIComponent(metadata.uk) +
+      "&fid=" + encodeURIComponent(String(item.fs_id ?? item.fsId)) +
+      "&sign=" + encodeURIComponent(metadata.sign) +
+      "&timestamp=" + encodeURIComponent(metadata.timestamp) +
+      "&type=M3U8_AUTO_480";
+  }
+
   return {
     filename,
     sizeBytes: size,
-    sizeFormatted: formatBytes(size),
+    sizeFormatted: size ? formatBytes(size) : "Unknown size",
     isVideo: VIDEO_EXTENSIONS.has(ext),
-    isZip: ext === ".zip" || ext === ".rar" || ext === ".7z",
-    downloadUrl: typeof item?.dlink === "string" && item.dlink ? item.dlink : undefined,
-    fsId: item?.fs_id ? String(item.fs_id) : undefined,
-    path: item?.path,
+    isZip: /\.(zip|rar|7z)$/i.test(filename),
+    downloadUrl,
+    fsId: valueAsString(item.fs_id ?? item.fsId),
+    path: valueAsString(item.path),
     streamUrl,
-    thumbs: item?.thumbs,
-    sign,
-    timestamp,
-    duration: item?.duration ? Number.parseInt(String(item.duration), 10) : undefined,
+    thumbs: item.thumbs && typeof item.thumbs === "object" ? item.thumbs : undefined,
+    sign: valueAsString(item.sign) || metadata.sign,
+    timestamp: valueAsString(item.timestamp) || metadata.timestamp,
+    duration: Number(item.duration) > 0 ? Number(item.duration) : undefined,
   };
 }
 
-const DEFAULT_TERABOX_PROXY_URL =
-  "https://tbx-proxy.shakir-ansarii075.workers.dev/";
+function collectMetadataAndFiles(
+  value: any,
+  metadata: Partial<ResolvedMetadata>,
+  files: Map<string, ResolvedTeraboxFile>,
+  depth = 0
+): void {
+  if (value === null || value === undefined || depth > 8) return;
 
-function getTeraboxProxyUrl(): string {
-  return process.env.TERABOX_PROXY_URL?.trim() || DEFAULT_TERABOX_PROXY_URL;
-}
-
-function getConfiguredTeraboxCookieHeader(): string {
-  const raw = process.env.TERABOX_COOKIE_HEADER?.trim();
-  if (!raw) return "";
-  try {
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return Object.entries(parsed)
-        .map(([name, value]) => `${name}=${String(value)}`)
-        .join("; ");
+  if (Array.isArray(value)) {
+    for (const item of value.slice(0, 2000)) {
+      collectMetadataAndFiles(item, metadata, files, depth + 1);
     }
-  } catch {}
-  return raw;
-}
-
-function normalizeProxySurl(surl: string): string {
-  // The proxy normalizes the public /s/1... form to the API's shorturl form.
-  return surl.length === 23 && surl.startsWith("1") ? surl.slice(1) : surl;
-}
-
-async function resolveTeraboxViaProxy(rawUrl: string): Promise<ResolvedMetadata | null> {
-  const surl = extractSurl(rawUrl);
-  if (!surl) return null;
-
-  const proxyUrl = getTeraboxProxyUrl();
-  const normalizedSurl = normalizeProxySurl(surl);
-  const attempts = [
-    { mode: "lookup", raw: false, refresh: false },
-    { mode: "resolve", raw: false, refresh: false },
-    { mode: "resolve", raw: true, refresh: true },
-  ];
-
-  const failures: string[] = [];
-
-  for (const attempt of attempts) {
-    try {
-      const endpoint = new URL(proxyUrl);
-      endpoint.searchParams.set("mode", attempt.mode);
-      endpoint.searchParams.set("surl", normalizedSurl);
-      if (attempt.raw) endpoint.searchParams.set("raw", "1");
-      if (attempt.refresh) endpoint.searchParams.set("refresh", "1");
-
-      const response = await fetch(endpoint, {
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-          Accept: "application/json",
-          ...(getConfiguredTeraboxCookieHeader() ? { Cookie: getConfiguredTeraboxCookieHeader() } : {}),
-        },
-      });
-
-      const rawText = await response.text();
-      let payload: any = null;
-      try {
-        payload = rawText ? JSON.parse(rawText) : null;
-      } catch {
-        payload = null;
-      }
-
-      if (!response.ok) {
-        const detail =
-          payload?.error ||
-          payload?.message ||
-          payload?.details ||
-          (rawText ? rawText.slice(0, 200) : "");
-        failures.push(
-          `mode=${attempt.mode} HTTP ${response.status}${detail ? `: ${detail}` : ""}`
-        );
-        continue;
-      }
-
-      if (payload?.error) {
-        failures.push(
-          `mode=${attempt.mode}: ${payload.error}${payload.details ? ` (${String(payload.details).slice(0, 200)})` : ""}`
-        );
-        continue;
-      }
-
-      const upstream = payload?.upstream || payload?.data || payload;
-      const rawItems = Array.isArray(upstream?.list) ? upstream.list : [];
-      const files: ResolvedTeraboxFile[] = [];
-
-      for (const item of rawItems) {
-        const file = createTeraboxFileMetadata(
-          item,
-          upstream?.shareid ? String(upstream.shareid) : upstream?.share_id ? String(upstream.share_id) : undefined,
-          upstream?.uk ? String(upstream.uk) : undefined,
-          upstream?.sign ? String(upstream.sign) : undefined,
-          upstream?.timestamp ? String(upstream.timestamp) : undefined
-        );
-        if (file) files.push(file);
-      }
-
-      // The proxy returns a compact record on D1 cache hits.
-      if (files.length === 0 && upstream?.dlink) {
-        const filename = cleanFilename(String(upstream.name || "terabox_download"));
-        const size = Number(upstream.size) || 0;
-        const ext = path.extname(filename).toLowerCase();
-        files.push({
-          filename,
-          sizeBytes: size,
-          sizeFormatted: size > 0 ? formatBytes(size) : "Unknown size",
-          isVideo: VIDEO_EXTENSIONS.has(ext),
-          isZip: /\.(zip|rar|7z)$/i.test(filename),
-          downloadUrl: String(upstream.dlink),
-          fsId: upstream.fid ? String(upstream.fid) : undefined,
-        });
-      }
-
-      const downloadableFiles = files.filter((file) => file.downloadUrl || file.streamUrl);
-      if (downloadableFiles.length === 0) {
-        failures.push(`mode=${attempt.mode}: no downloadable files`);
-        continue;
-      }
-
-      console.log(
-        "TeraBox resolver fallback succeeded through proxy mode=" +
-          attempt.mode +
-          " surl=" +
-          normalizedSurl +
-          " files=" +
-          downloadableFiles.length
-      );
-
-      return {
-        shareId: upstream?.shareid ? String(upstream.shareid) : upstream?.share_id ? String(upstream.share_id) : undefined,
-        uk: upstream?.uk ? String(upstream.uk) : undefined,
-        sign: upstream?.sign ? String(upstream.sign) : undefined,
-        timestamp: upstream?.timestamp ? String(upstream.timestamp) : undefined,
-        title: upstream?.title
-          ? cleanFilename(String(upstream.title))
-          : downloadableFiles[0]?.filename || "TeraBox Files",
-        files: downloadableFiles,
-        directDownloadPossible: true,
-        cookies: undefined,
-        refererUrl: "https://www.terabox.app/",
-      };
-    } catch (error) {
-      failures.push(
-        `mode=${attempt.mode}: ${error instanceof Error ? error.message : String(error)}`
-      );
-    }
+    return;
   }
 
-  throw new Error(
-    `TeraBox proxy could not resolve the share (surl=${normalizedSurl}; ${failures.join(" | ")})`
-  );
+  if (typeof value !== "object") return;
+
+  const shareId = valueAsString(value.shareid ?? value.shareId ?? value.share_id);
+  const uk = valueAsString(value.uk);
+  const sign = valueAsString(value.sign);
+  const timestamp = valueAsString(value.timestamp);
+  const randsk = valueAsString(value.randsk);
+  const title = valueAsString(value.title ?? value.share_title);
+
+  if (shareId) metadata.shareId = shareId;
+  if (uk) metadata.uk = uk;
+  if (sign) metadata.sign = sign;
+  if (timestamp) metadata.timestamp = timestamp;
+  if (randsk) metadata.randsk = randsk;
+  if (title && !metadata.title) metadata.title = title;
+
+  const file = fileFromObject(value, metadata);
+  if (file) mergeFile(files, file);
+
+  for (const [key, child] of Object.entries(value)) {
+    if (/^(headers|requestHeaders|responseHeaders)$/i.test(key)) continue;
+    if (typeof child === "object" && child !== null) {
+      collectMetadataAndFiles(child, metadata, files, depth + 1);
+    }
+  }
 }
 
+function collectUrlsFromValue(
+  value: any,
+  downloadUrls: string[],
+  streamUrls: string[],
+  depth = 0
+): void {
+  if (value === null || value === undefined || depth > 8) return;
 
-let browserResolverInProgress = false;
+  if (Array.isArray(value)) {
+    for (const item of value.slice(0, 2000)) {
+      collectUrlsFromValue(item, downloadUrls, streamUrls, depth + 1);
+    }
+    return;
+  }
 
-function getChromiumExecutablePath(): string {
-  return (
-    process.env.TERABOX_CHROMIUM_PATH?.trim() ||
-    process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH?.trim() ||
-    "/usr/bin/chromium"
-  );
+  if (typeof value !== "object") return;
+
+  for (const [key, child] of Object.entries(value)) {
+    if (typeof child === "string" && /^https?:\/\//i.test(child)) {
+      if (/(?:dlink|download)/i.test(key) || /(?:download|dlink)/i.test(child)) {
+        if (!downloadUrls.includes(child)) downloadUrls.push(child);
+      }
+      if (/(?:m3u8|streaming|stream_url)/i.test(key) || /(?:m3u8|streaming)/i.test(child)) {
+        if (!streamUrls.includes(child)) streamUrls.push(child);
+      }
+    } else if (typeof child === "object" && child !== null) {
+      collectUrlsFromValue(child, downloadUrls, streamUrls, depth + 1);
+    }
+  }
+}
+
+async function parseResponse(
+  response: any,
+  metadata: Partial<ResolvedMetadata>,
+  files: Map<string, ResolvedTeraboxFile>,
+  downloadUrls: string[],
+  streamUrls: string[],
+  summaries: string[]
+): Promise<void> {
+  const url = response.url();
+  if (!isInterestingUrl(url)) return;
+
+  const status = response.status();
+  summaries.push(status + " " + url.slice(0, 320));
+
+  if (/(?:download|dlink)/i.test(url) && /^https?:/i.test(url)) {
+    if (!downloadUrls.includes(url)) downloadUrls.push(url);
+  }
+  if (/(?:m3u8|streaming)/i.test(url) && /^https?:/i.test(url)) {
+    if (!streamUrls.includes(url)) streamUrls.push(url);
+  }
+
+  try {
+    const contentType = String(response.headers()["content-type"] || "").toLowerCase();
+    if (!contentType.includes("json") && !/(?:shorturlinfo|share\/list|share\/download|streaming)/i.test(url)) {
+      return;
+    }
+
+    const body = await response.text();
+    if (!body || body.length > 2_000_000) return;
+
+    let payload: any = null;
+    try {
+      payload = JSON.parse(body);
+    } catch {
+      const urls = body.match(/https?:\\?\/\\?\/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+/g) || [];
+      for (const raw of urls) {
+        const cleaned = raw.replace(/\\\//g, "/").replace(/[\"'<>\s]+$/g, "");
+        if (/(?:download|dlink)/i.test(cleaned) && !downloadUrls.includes(cleaned)) downloadUrls.push(cleaned);
+        if (/(?:m3u8|streaming)/i.test(cleaned) && !streamUrls.includes(cleaned)) streamUrls.push(cleaned);
+      }
+      return;
+    }
+
+    collectMetadataAndFiles(payload, metadata, files);
+    collectUrlsFromValue(payload, downloadUrls, streamUrls);
+  } catch (error) {
+    console.warn("Chromium response parse failed:", error);
+  }
+}
+
+async function scrapeDom(
+  page: Page,
+  metadata: Partial<ResolvedMetadata>,
+  files: Map<string, ResolvedTeraboxFile>,
+  downloadUrls: string[],
+  streamUrls: string[]
+): Promise<void> {
+  const data = await page.evaluate(() => {
+    const nodes = Array.from(document.querySelectorAll(
+      "a,button,[role='button'],[data-fsid],[data-fs-id],[data-url],[data-download-url]"
+    )).map((el: any) => ({
+      text: String(el.innerText || el.textContent || "").trim().slice(0, 400),
+      href: typeof el.href === "string" ? el.href : "",
+      fsId: String(el.getAttribute("data-fsid") || el.getAttribute("data-fs-id") || ""),
+      url: String(el.getAttribute("data-url") || el.getAttribute("data-download-url") || ""),
+      download: /download/i.test(String(el.innerText || el.textContent || "")),
+    }));
+
+    const globals: Record<string, unknown> = {};
+    for (const key of [
+      "__INITIAL_STATE__",
+      "__INITIAL_DATA__",
+      "initialState",
+      "initialData",
+      "initData",
+      "yunData",
+      "shareInfo",
+      "pageData",
+    ]) {
+      try {
+        const value = (window as any)[key];
+        if (value !== undefined) globals[key] = value;
+      } catch {}
+    }
+
+    return {
+      title: document.title || "",
+      bodyText: document.body?.innerText?.slice(0, 16000) || "",
+      nodes,
+      jsonScripts: Array.from(document.querySelectorAll("script[type='application/json']"))
+        .map((s) => (s.textContent || "").slice(0, 500000)),
+      globals,
+    };
+  });
+
+  if (data.title && data.title !== "TeraBox") metadata.title = data.title;
+
+  for (const text of data.jsonScripts) {
+    try {
+      collectMetadataAndFiles(JSON.parse(text), metadata, files);
+    } catch {}
+  }
+
+  collectMetadataAndFiles(data.globals, metadata, files);
+
+  for (const node of data.nodes) {
+    const candidateUrl = node.href || node.url;
+    if (candidateUrl && /^https?:/i.test(candidateUrl)) {
+      if (/(?:download|dlink)/i.test(candidateUrl) && !downloadUrls.includes(candidateUrl)) downloadUrls.push(candidateUrl);
+      if (/(?:m3u8|streaming)/i.test(candidateUrl) && !streamUrls.includes(candidateUrl)) streamUrls.push(candidateUrl);
+    }
+
+    if (!node.fsId) continue;
+    const file = {
+      filename: cleanFilename(node.text.replace(/\bdownload\b/ig, "").trim()),
+      sizeBytes: 0,
+      sizeFormatted: "Unknown size",
+      isVideo: VIDEO_EXTENSIONS.has(path.extname(node.text).toLowerCase()),
+      isZip: /\.(zip|rar|7z)$/i.test(node.text),
+      fsId: node.fsId,
+      downloadUrl: /(?:download|dlink)/i.test(candidateUrl) ? candidateUrl : undefined,
+      streamUrl: /(?:m3u8|streaming)/i.test(candidateUrl) ? candidateUrl : undefined,
+    };
+
+    if (file.filename !== "terabox_download") mergeFile(files, file);
+  }
+}
+
+async function maybeTriggerDownloadAction(
+  page: Page,
+  downloadUrls: string[]
+): Promise<void> {
+  const buttons = page.getByRole("button", { name: /download/i });
+  const count = await buttons.count();
+  if (!count) return;
+
+  for (let i = 0; i < Math.min(count, 2); i++) {
+    const button = buttons.nth(i);
+    if (!(await button.isVisible().catch(() => false))) continue;
+
+    const before = downloadUrls.length;
+    console.log("Chromium resolver: attempting visible Download action");
+    await button.click({ timeout: 5000 }).catch(() => undefined);
+    await page.waitForTimeout(2500);
+    if (downloadUrls.length > before) return;
+  }
 }
 
 async function resolveTeraboxViaChromium(rawUrl: string): Promise<ResolvedMetadata> {
-  if (browserResolverInProgress) {
-    throw new Error("Chromium resolver is already busy.");
-  }
-
   const shortCode = extractSurl(rawUrl);
-  if (!shortCode) {
-    throw new Error("Could not extract a TeraBox share code for Chromium resolution.");
-  }
+  if (!shortCode) throw new Error("Could not extract a TeraBox share code.");
 
-  browserResolverInProgress = true;
-  let browser: Awaited<ReturnType<typeof chromium.launch>> | null = null;
+  return withChromiumSlot(async () => {
+    let browser: Browser | null = null;
 
-  try {
-    browser = await chromium.launch({
-      executablePath: getChromiumExecutablePath(),
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--disable-software-rasterizer",
-        "--disable-extensions",
-        "--disable-background-networking",
-        "--disable-background-timer-throttling",
-        "--disable-renderer-backgrounding",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-features=Translate,BackForwardCache",
-      ],
-      timeout: 15000,
-    });
-
-    const context = await browser.newContext({
-      userAgent:
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-      locale: "en-US",
-      viewport: { width: 1280, height: 720 },
-      serviceWorkers: "allow",
-    });
-
-    const page = await context.newPage();
-    page.setDefaultTimeout(10000);
-    console.log("Chromium resolver: opening TeraBox share page");
-
-    await page.goto(rawUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: 20000,
-    });
-    await page.waitForTimeout(2500);
-
-    const finalUrl = page.url();
-    const pageText = await page.content();
-    const jsTokenMatch =
-      pageText.match(/fn\("([A-F0-9]+)"\)/i) ||
-      pageText.match(/fn%28%22([^%"]+)%22%29/i) ||
-      pageText.match(/window\.jsToken\s*=\s*["']([^"']+)["']/i);
-    const jsToken = jsTokenMatch?.[1] || "";
-
-    const browserCookies = await context.cookies();
-    const cookieHeader = browserCookies
-      .map((cookie) => cookie.name + "=" + cookie.value)
-      .join("; ");
-
-    let apiOrigin = "https://www.terabox.app";
     try {
-      const origin = new URL(finalUrl).origin;
-      if (origin.includes("terabox")) apiOrigin = origin;
-    } catch {}
+      browser = await chromium.launch({
+        executablePath: chromiumPath(),
+        headless: true,
+        timeout: 30000,
+        args: [
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--disable-dev-shm-usage",
+          "--disable-gpu",
+          "--disable-software-rasterizer",
+          "--disable-extensions",
+          "--disable-background-networking",
+          "--disable-background-timer-throttling",
+          "--disable-renderer-backgrounding",
+          "--disable-features=Translate,BackForwardCache",
+          "--disable-blink-features=AutomationControlled",
+          "--no-first-run",
+          "--no-default-browser-check",
+        ],
+      });
 
-    const browserData = await page.evaluate(
-      async ({ origin, shortCode, jsToken }) => {
-        const variants = [
-          shortCode,
-          shortCode.startsWith("1") ? shortCode.slice(1) : "1" + shortCode,
-        ].filter((value, index, values) => value && values.indexOf(value) === index);
+      const context = await browser.newContext({
+        locale: "en-US",
+        timezoneId: "Asia/Kolkata",
+        viewport: { width: 1366, height: 768 },
+        screen: { width: 1366, height: 768 },
+        colorScheme: "light",
+        serviceWorkers: "allow",
+        extraHTTPHeaders: {
+          "Accept-Language": "en-US,en;q=0.9",
+          DNT: "1",
+        },
+      });
 
-        const result: {
-          info: any | null;
-          list: any[];
-          errors: string[];
-        } = { info: null, list: [], errors: [] };
+      await context.addInitScript(() => {
+        Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+        Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
+        Object.defineProperty(navigator, "platform", { get: () => "Linux x86_64" });
+      });
 
-        for (const variant of variants) {
-          try {
-            const infoUrl = new URL("/api/shorturlinfo", origin);
-            infoUrl.searchParams.set("app_id", "250528");
-            infoUrl.searchParams.set("shorturl", variant);
-            infoUrl.searchParams.set("root", "1");
-            infoUrl.searchParams.set("web", "1");
-            infoUrl.searchParams.set("channel", "dubox");
-            infoUrl.searchParams.set("clienttype", "0");
-            if (jsToken) infoUrl.searchParams.set("jsToken", jsToken);
+      const page = await context.newPage();
+      page.setDefaultTimeout(15000);
 
-            const response = await fetch(infoUrl.toString(), {
-              credentials: "include",
-              headers: {
-                Accept: "application/json, text/plain, */*",
-                "X-Requested-With": "XMLHttpRequest",
-              },
-            });
-            const text = await response.text();
-            let payload: any = null;
-            try { payload = text ? JSON.parse(text) : null; } catch {}
+      const metadata: Partial<ResolvedMetadata> = {};
+      const files = new Map<string, ResolvedTeraboxFile>();
+      const downloadUrls: string[] = [];
+      const streamUrls: string[] = [];
+      const summaries: string[] = [];
+      const networkErrors: string[] = [];
+      const responseJobs = new Set<Promise<void>>();
 
-            if (response.ok && Number(payload?.errno ?? 0) === 0 && Array.isArray(payload?.list)) {
-              result.info = payload;
-              break;
-            }
-
-            result.errors.push(
-              "shorturlinfo " + variant + " HTTP " + response.status +
-              " errno=" + String(payload?.errno ?? "unknown")
-            );
-          } catch (error) {
-            result.errors.push(
-              "shorturlinfo " + variant + ": " +
-              (error instanceof Error ? error.message : String(error))
-            );
-          }
+      page.on("console", (msg) => {
+        if (/error|warning/i.test(msg.type())) {
+          console.log("Chromium page console:", msg.text().slice(0, 500));
         }
+      });
 
-        const shareShortUrl =
-          result.info?.shorturl ||
-          result.info?.shorturlinfo?.shorturl ||
-          variants[0] ||
-          shortCode;
+      page.on("request", (request) => {
+        const url = request.url();
+        if (!isInterestingUrl(url)) return;
+        if (/(?:download|dlink)/i.test(url) && !downloadUrls.includes(url)) downloadUrls.push(url);
+        if (/(?:m3u8|streaming)/i.test(url) && !streamUrls.includes(url)) streamUrls.push(url);
+      });
 
-        try {
-          const listUrl = new URL("/share/list", origin);
-          listUrl.searchParams.set("app_id", "250528");
-          listUrl.searchParams.set("web", "1");
-          listUrl.searchParams.set("channel", "0");
-          listUrl.searchParams.set("clienttype", "0");
-          if (jsToken) listUrl.searchParams.set("jsToken", jsToken);
-          listUrl.searchParams.set("shorturl", shareShortUrl);
-          listUrl.searchParams.set("page", "1");
-          listUrl.searchParams.set("num", "100");
-          listUrl.searchParams.set("by", "name");
-          listUrl.searchParams.set("order", "asc");
-          listUrl.searchParams.set("root", "1");
+      page.on("response", (response) => {
+        const job = parseResponse(response, metadata, files, downloadUrls, streamUrls, summaries)
+          .catch((error) => {
+            networkErrors.push("response-handler: " + (error instanceof Error ? error.message : String(error)));
+          })
+          .finally(() => responseJobs.delete(job));
+        responseJobs.add(job);
+      });
 
-          const response = await fetch(listUrl.toString(), {
-            credentials: "include",
-            headers: {
-              Accept: "application/json, text/plain, */*",
-              "X-Requested-With": "XMLHttpRequest",
-            },
-          });
-          const text = await response.text();
-          let payload: any = null;
-          try { payload = text ? JSON.parse(text) : null; } catch {}
-
-          if (response.ok && Number(payload?.errno ?? 0) === 0 && Array.isArray(payload?.list)) {
-            result.list = payload.list;
-          } else {
-            result.errors.push(
-              "share/list HTTP " + response.status +
-              " errno=" + String(payload?.errno ?? "unknown")
-            );
-          }
-        } catch (error) {
-          result.errors.push(
-            "share/list: " + (error instanceof Error ? error.message : String(error))
-          );
+      page.on("requestfailed", (request) => {
+        const url = request.url();
+        if (isInterestingUrl(url)) {
+          networkErrors.push((request.failure()?.errorText || "request failed") + " " + url.slice(0, 250));
         }
+      });
 
-        return result;
-      },
-      { origin: apiOrigin, shortCode, jsToken }
-    );
+      console.log("TeraBox resolver mode: Playwright + Chromium only");
+      console.log("Chromium executable:", chromiumPath());
+      console.log("Chromium resolver: opening TeraBox share page");
 
-    const info = browserData.info;
-    const rawItems = [
-      ...(Array.isArray(info?.list) ? info.list : []),
-      ...(Array.isArray(browserData.list) ? browserData.list : []),
-    ];
+      const navigation = await page.goto(rawUrl, {
+        waitUntil: "domcontentloaded",
+        timeout: 30000,
+      });
 
-    const uniqueItems = new Map<string, any>();
-    for (const item of rawItems) {
-      const key = item?.fs_id
-        ? "fs:" + item.fs_id
-        : "path:" + (item?.path || item?.server_filename || item?.filename || JSON.stringify(item));
-      if (!uniqueItems.has(key)) uniqueItems.set(key, item);
-    }
+      console.log(
+        "Chromium navigation status=" + (navigation?.status() ?? "none") +
+        " url=" + page.url()
+      );
 
-    const shareId = info?.shareid ? String(info.shareid) : undefined;
-    const uk = info?.uk ? String(info.uk) : undefined;
-    const sign = info?.sign ? String(info.sign) : undefined;
-    const timestamp = info?.timestamp ? String(info.timestamp) : undefined;
-    const randsk = info?.randsk ? decodeURIComponent(String(info.randsk)) : undefined;
-    const files: ResolvedTeraboxFile[] = [];
+      await page.waitForLoadState("networkidle", { timeout: 12000 }).catch(() => {});
+      await page.waitForTimeout(5000);
 
-    for (const item of uniqueItems.values()) {
-      const file = createTeraboxFileMetadata(item, shareId, uk, sign, timestamp);
-      if (file) files.push(file);
-    }
+      await Promise.allSettled([...responseJobs]);
+      await scrapeDom(page, metadata, files, downloadUrls, streamUrls);
 
-    if (shareId && uk && sign && timestamp) {
-      for (const file of files) {
-        if (file.downloadUrl || !file.fsId) continue;
-        file.downloadUrl = await fetchTeraboxDownloadUrl(
-          shareId, uk, sign, timestamp, file.fsId, jsToken, cookieHeader, finalUrl
+      // Give lazy-loaded rows a chance to render.
+      for (let i = 0; i < 5; i++) {
+        await page.mouse.wheel(0, 1000);
+        await page.waitForTimeout(800);
+      }
+
+      await Promise.allSettled([...responseJobs]);
+      await scrapeDom(page, metadata, files, downloadUrls, streamUrls);
+
+      if (files.size === 0 && downloadUrls.length === 0 && streamUrls.length === 0) {
+        await maybeTriggerDownloadAction(page, downloadUrls);
+        await page.waitForTimeout(2500);
+        await Promise.allSettled([...responseJobs]);
+        await scrapeDom(page, metadata, files, downloadUrls, streamUrls);
+      }
+
+      // Associate browser-observed download/stream URLs with metadata in the
+      // same order when the site's API returns URLs separately from file rows.
+      const fileList = [...files.values()];
+      for (let i = 0; i < downloadUrls.length && i < fileList.length; i++) {
+        if (!fileList[i].downloadUrl) fileList[i].downloadUrl = downloadUrls[i];
+      }
+      for (let i = 0; i < streamUrls.length; i++) {
+        const video = fileList.find((file) => file.isVideo && !file.streamUrl);
+        if (video) video.streamUrl = streamUrls[i];
+      }
+
+      const cookies = await context.cookies();
+      const cookieHeader = cookies.map((cookie) => cookie.name + "=" + cookie.value).join("; ");
+      const bodyText = await page.locator("body").innerText().catch(() => "");
+      const verificationDetected = /(?:captcha|verify|robot|unusual traffic|human verification|安全验证|人机)/i.test(bodyText);
+
+      const downloadable = fileList.filter((file) => file.downloadUrl || file.streamUrl);
+
+      console.log(
+        "Chromium resolver result:",
+        "metadataFiles=" + fileList.length,
+        "downloadable=" + downloadable.length,
+        "downloadUrls=" + downloadUrls.length,
+        "streamUrls=" + streamUrls.length,
+        "cookies=" + (cookieHeader ? "yes" : "no"),
+        "verification=" + (verificationDetected ? "yes" : "no"),
+        "interestingResponses=" + summaries.length
+      );
+
+      if (!downloadable.length) {
+        throw new Error(
+          "Playwright/Chromium could not resolve the link: " +
+          [
+            "surl=" + shortCode,
+            "page=" + page.url(),
+            "metadataFiles=" + fileList.length,
+            "downloadUrls=" + downloadUrls.length,
+            "streamUrls=" + streamUrls.length,
+            "verification=" + (verificationDetected ? "yes" : "no"),
+            "body=" + bodyText.slice(0, 700).replace(/\s+/g, " "),
+            "responses=" + summaries.slice(-15).join(" | "),
+            "networkErrors=" + networkErrors.slice(-8).join(" | "),
+          ].join("; ")
         );
       }
+
+      return {
+        shareId: metadata.shareId,
+        uk: metadata.uk,
+        sign: metadata.sign,
+        timestamp: metadata.timestamp,
+        randsk: metadata.randsk,
+        title: cleanFilename(metadata.title || downloadable[0].filename || "TeraBox Files"),
+        files: downloadable,
+        directDownloadPossible: downloadable.some((file) => !!file.downloadUrl),
+        cookies: cookieHeader || undefined,
+        refererUrl: page.url(),
+      };
+    } finally {
+      try { await browser?.close(); } catch {}
     }
-
-    const downloadableFiles = files.filter((file) => file.downloadUrl || file.streamUrl);
-    if (downloadableFiles.length === 0) {
-      throw new Error(
-        "Chromium resolver found no downloadable files (jsToken=" +
-        (jsToken ? "yes" : "no") + "; items=" + uniqueItems.size + "; " +
-        browserData.errors.join(" | ") + ")"
-      );
-    }
-
-    console.log(
-      "Chromium resolver succeeded: files=" + downloadableFiles.length +
-      " cookies=" + (cookieHeader ? "yes" : "no")
-    );
-
-    return {
-      shareId,
-      uk,
-      sign,
-      timestamp,
-      randsk,
-      title: info?.title
-        ? cleanFilename(String(info.title))
-        : downloadableFiles[0]?.filename || "TeraBox Files",
-      files: downloadableFiles,
-      directDownloadPossible: true,
-      cookies: cookieHeader,
-      refererUrl: finalUrl,
-    };
-  } finally {
-    try { await browser?.close(); } catch {}
-    browserResolverInProgress = false;
-  }
+  });
 }
 
 export async function resolveTeraboxLink(rawUrl: string): Promise<ResolvedMetadata> {
-  const cleanUrl = rawUrl.trim();
-  const shortCode = extractSurl(cleanUrl);
-  const headers = {
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    Referer: "https://www.terabox.app/",
-    ...(getConfiguredTeraboxCookieHeader() ? { Cookie: getConfiguredTeraboxCookieHeader() } : {}),
-  };
-
-  let pageText = "";
-  let finalUrl = cleanUrl;
-  let cookieHeader = "";
-  try {
-    const response = await fetch(cleanUrl, { headers, redirect: "follow" });
-    finalUrl = response.url || cleanUrl;
-    pageText = await response.text();
-    const setCookieValues = (response.headers as any).getSetCookie?.() || [];
-    const rawCookies = setCookieValues.length
-      ? setCookieValues.join(", ")
-      : response.headers.get("set-cookie") || "";
-    if (rawCookies) {
-      cookieHeader = rawCookies
-        .split(/,(?=[^;,]+=)/)
-        .map((c) => c.split(";")[0].trim())
-        .filter(Boolean)
-        .join("; ");
-    }
-  } catch (fetchErr) {
-    console.warn("Error fetching initial TeraBox page:", fetchErr);
-  }
-
-  // Keep the leading "1" from the public share URL. Current TeraBox share/list
-  // implementations expect the original shorturl value (for example 1abc...).
-  const finalSurl = extractSurl(finalUrl) || shortCode || "";
-  const jsTokenMatch =
-    pageText.match(/fn\("([A-F0-9]+)"\)/i) ||
-    pageText.match(/fn%28%22([^%"]+)%22%29/i) ||
-    pageText.match(/window\.jsToken\s*=\s*["']([^"']+)["']/i);
-  const jsToken = jsTokenMatch ? jsTokenMatch[1] : "";
-  const dpLogIdMatch =
-    pageText.match(/dp-logid[=\\"]([^&\\"]+)/i) ||
-    pageText.match(/dpLogId[\\":=]+([0-9]+)/i);
-  const dpLogId = dpLogIdMatch ? dpLogIdMatch[1] : "";
-  let apiOrigin = "https://www.terabox.app";
-  try {
-    const origin = new URL(finalUrl).origin;
-    if (origin.includes("terabox")) apiOrigin = origin;
-  } catch {}
-
-  const allItems: any[] = [];
-  let shareId: string | undefined;
-  let uk: string | undefined;
-  let sign: string | undefined;
-  let timestamp: string | undefined;
-  let randsk: string | undefined;
-  let title = "";
-
-  if (finalSurl) {
-    const variations = [finalSurl, finalSurl.startsWith("1") ? finalSurl.slice(1) : "1" + finalSurl]
-      .filter((value, index, values) => value && values.indexOf(value) === index);
-    const infoOrigins = [...new Set([
-      apiOrigin,
-      "https://www.terabox.app",
-      "https://www.terabox.com",
-      "https://www.1024tera.com",
-    ])];
-
-    for (const surlVariant of variations) {
-      let infoResolved = false;
-      for (const infoOrigin of infoOrigins) {
-        try {
-          const infoUrl = new URL("/api/shorturlinfo", infoOrigin);
-          infoUrl.searchParams.set("app_id", "250528");
-          infoUrl.searchParams.set("shorturl", surlVariant);
-          infoUrl.searchParams.set("root", "1");
-          infoUrl.searchParams.set("web", "1");
-          infoUrl.searchParams.set("channel", "dubox");
-          infoUrl.searchParams.set("clienttype", "0");
-          if (jsToken) infoUrl.searchParams.set("jsToken", jsToken);
-          if (dpLogId) infoUrl.searchParams.set("dp-logid", dpLogId);
-
-          const apiRes = await fetch(infoUrl, {
-            headers: {
-              ...headers,
-              Accept: "application/json, text/plain, */*",
-              "X-Requested-With": "XMLHttpRequest",
-              Referer: finalUrl,
-              ...(cookieHeader ? { Cookie: cookieHeader } : {}),
-            },
-          });
-
-          if (!apiRes.ok) {
-            console.warn(
-              "TeraBox shorturlinfo HTTP " + apiRes.status +
-              " origin=" + infoOrigin + " shorturl=" + surlVariant
-            );
-            continue;
-          }
-
-          const apiData = (await apiRes.json()) as any;
-          const infoErrno = Number(apiData?.errno ?? 0);
-          if (infoErrno !== 0 || !Array.isArray(apiData?.list)) {
-            console.warn(
-              "TeraBox shorturlinfo rejected origin=" + infoOrigin +
-              " shorturl=" + surlVariant +
-              " errno=" + infoErrno +
-              " errmsg=" + (apiData?.errmsg || "none")
-            );
-            continue;
-          }
-
-          console.log(
-            "TeraBox shorturlinfo resolved origin=" + infoOrigin +
-            " shorturl=" + surlVariant +
-            " items=" + apiData.list.length
-          );
-
-          shareId = apiData.shareid ? String(apiData.shareid) : undefined;
-          uk = apiData.uk ? String(apiData.uk) : undefined;
-          sign = apiData.sign ? String(apiData.sign) : undefined;
-          timestamp = apiData.timestamp ? String(apiData.timestamp) : undefined;
-          randsk = apiData.randsk ? decodeURIComponent(String(apiData.randsk)) : undefined;
-          title = apiData.title ? cleanFilename(String(apiData.title)) : "";
-          allItems.push(...apiData.list);
-          infoResolved = true;
-          break;
-        } catch (error) {
-          console.warn(
-            "TeraBox shorturlinfo request failed origin=" + infoOrigin +
-            " shorturl=" + surlVariant + ":",
-            error
-          );
-        }
-      }
-      if (infoResolved) break;
-    }
-  }
-
-  if (finalSurl && jsToken) {
-    try {
-      // The share/list endpoint is the primary resolver. Unlike shorturlinfo,
-      // it is still used by current open-source clients with the original
-      // "1..." shorturl and returns dlink/server_filename directly.
-      const rootItems = await fetchTeraboxShareList(apiOrigin, finalSurl, jsToken, cookieHeader, finalUrl, undefined, dpLogId);
-      allItems.push(...rootItems);
-      const pendingDirs = rootItems.filter((item) => String(item?.isdir ?? "0") === "1");
-      const visitedDirs = new Set<string>();
-      let foldersScanned = 0;
-      while (pendingDirs.length > 0 && foldersScanned < 50) {
-        const directory = pendingDirs.shift();
-        const dirPath = String(directory?.path || "");
-        if (!dirPath || visitedDirs.has(dirPath)) continue;
-        visitedDirs.add(dirPath);
-        foldersScanned++;
-        try {
-          const children = await fetchTeraboxShareList(apiOrigin, finalSurl, jsToken, cookieHeader, finalUrl, dirPath, dpLogId);
-          allItems.push(...children);
-          for (const child of children) {
-            if (String(child?.isdir ?? "0") === "1") pendingDirs.push(child);
-          }
-        } catch (folderErr) {
-          console.warn("Could not inspect TeraBox folder " + dirPath + ":", folderErr);
-        }
-      }
-    } catch (listErr) {
-      console.warn("TeraBox share/list fallback failed:", listErr);
-    }
-  }
-
-  const uniqueItems = new Map<string, any>();
-  for (const item of allItems) {
-    const key = item?.fs_id
-      ? "fs:" + item.fs_id
-      : "path:" + (item?.path || item?.server_filename || item?.filename || JSON.stringify(item));
-    if (!uniqueItems.has(key)) uniqueItems.set(key, item);
-  }
-
-  const files: ResolvedTeraboxFile[] = [];
-  for (const item of uniqueItems.values()) {
-    const file = createTeraboxFileMetadata(item, shareId, uk, sign, timestamp);
-    if (file) files.push(file);
-  }
-
-  if (files.length === 0 && pageText) {
-    const listMatch =
-      pageText.match(/window\.initData\s*=\s*({.*?});/s) ||
-      pageText.match(/list:\s*(\[\{.*?\}\])/s) ||
-      pageText.match(/"list":\s*(\[\{.*?\}\])/s);
-    if (listMatch) {
-      try {
-        const parsed = JSON.parse(listMatch[1]);
-        const items = Array.isArray(parsed) ? parsed : parsed.list || [];
-        for (const item of items) {
-          const file = createTeraboxFileMetadata(item, shareId, uk, sign, timestamp);
-          if (file) files.push(file);
-        }
-      } catch {}
-    }
-  }
-
-  if (shareId && uk && sign && timestamp) {
-    for (const file of files) {
-      if (file.downloadUrl || !file.fsId) continue;
-      file.downloadUrl = await fetchTeraboxDownloadUrl(
-        shareId, uk, sign, timestamp, file.fsId, jsToken, cookieHeader, finalUrl
-      );
-    }
-  }
-
-  let downloadableFiles = files.filter((file) => file.downloadUrl || file.streamUrl);
-
-  // TeraBox now frequently answers direct Render/server requests with
-  // errno=400141 ("need verify") before exposing jsToken. A separate
-  // resolver/proxy can fetch the share page from a different egress and has
-  // its own short-lived metadata cache. Use it only after the direct path
-  // produced no usable downloadable files.
-  if (downloadableFiles.length === 0) {
-    try {
-      const proxyMetadata = await resolveTeraboxViaProxy(cleanUrl);
-      if (proxyMetadata?.files?.length) {
-        return proxyMetadata;
-      }
-    } catch (proxyError) {
-      console.warn("TeraBox proxy fallback failed:", proxyError);
-    }
-  }
-
-  if (downloadableFiles.length === 0) {
-    try {
-      const chromiumMetadata = await resolveTeraboxViaChromium(cleanUrl);
-      if (chromiumMetadata?.files?.length) return chromiumMetadata;
-    } catch (chromiumError) {
-      console.warn("TeraBox Chromium fallback failed:", chromiumError);
-    }
-  }
-
-  if (downloadableFiles.length === 0) {
-    const diagnostic = [
-      "surl=" + (finalSurl || "missing"),
-      "jsToken=" + (jsToken ? "yes" : "no"),
-      "items=" + uniqueItems.size,
-      "shareid=" + (shareId ? "yes" : "no"),
-      "uk=" + (uk ? "yes" : "no"),
-      "sign=" + (sign ? "yes" : "no"),
-      "timestamp=" + (timestamp ? "yes" : "no"),
-      "dpLogId=" + (dpLogId ? "yes" : "no"),
-      "cookies=" + (cookieHeader ? "yes" : "no"),
-      "finalHost=" + (() => { try { return new URL(finalUrl).host; } catch { return "unknown"; } })(),
-    ].join(", ");
-    throw new Error("No downloadable files were found in this TeraBox link (" + diagnostic + ").");
-  }
-
-  return {
-    shareId,
-    uk,
-    sign,
-    timestamp,
-    randsk,
-    title: title || downloadableFiles[0]?.filename || "TeraBox Files",
-    files: downloadableFiles,
-    directDownloadPossible: downloadableFiles.some((file) => !!file.downloadUrl || !!file.streamUrl),
-    cookies: cookieHeader,
-    refererUrl: finalUrl,
-  };
+  return resolveTeraboxViaChromium(rawUrl.trim());
 }
 
-/**
- * Downloads an HLS / M3U8 stream into a local MP4 file.
- * To bypass TeraBox's 30-second preview limit on unauthenticated/web streams,
- * this function scans across the entire video timeline (in increments of 25 seconds)
- * using the `time` parameter to discover all chunks for the entire video duration,
- * expands each segment's byte-range to download the full chunk, and muxes them into a complete MP4.
- */
 export async function downloadM3u8Stream(
   m3u8Url: string,
   outputMp4Path: string,
@@ -1109,171 +640,120 @@ export async function downloadM3u8Stream(
   }
 ): Promise<void> {
   const headers: Record<string, string> = {
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     Referer: refererUrl || "https://www.terabox.app/",
   };
-  
+
   const effectiveCookies = [
     cookieHeader || "",
-    metadata?.randsk ? `TSID=${metadata.randsk}` : ""
+    metadata?.randsk ? "TSID=" + metadata.randsk : "",
   ].filter(Boolean).join("; ");
 
-  if (effectiveCookies) {
-    headers["Cookie"] = effectiveCookies;
-  }
+  if (effectiveCookies) headers.Cookie = effectiveCookies;
 
-  // Map to store unique video chunks by index: chunkIndex -> { url: string; size: number }
-  const discoveredChunks = new Map<number, { url: string; size: number }>();
+  const discovered = new Map<number, { url: string; size: number }>();
 
-  // Helper to extract segments from an M3U8 response text
-  const parseSegmentsFromM3u8 = (playlistText: string) => {
-    const lines = playlistText
-      .split("\n")
-      .map((l) => l.trim())
-      .filter((l) => l.length > 0 && !l.startsWith("#"));
-
-    for (const segUrl of lines) {
+  const parseSegments = (playlist: string) => {
+    const lines = playlist.split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
+    for (const segment of lines) {
       try {
-        const parsed = new URL(segUrl);
-        // Look for chunk index in URL path (e.g. _1_ts/, _2_ts/, etc.)
-        const match = parsed.pathname.match(/_(\d+)_ts\b/i);
-        const chunkIdx = match ? parseInt(match[1], 10) : discoveredChunks.size + 1;
-        const tsSizeStr = parsed.searchParams.get("ts_size");
-        const tsSize = tsSizeStr ? parseInt(tsSizeStr, 10) : 0;
-
-        if (!discoveredChunks.has(chunkIdx)) {
-          if (tsSize > 0) {
-            // Expand the byte-range to download the full segment instead of a 30s slice
-            parsed.searchParams.set("range", `0-${tsSize - 1}`);
-            parsed.searchParams.set("len", String(tsSize));
+        const parsed = new URL(segment, m3u8Url);
+        const indexMatch = parsed.pathname.match(/_(\d+)_ts\b/i);
+        const index = indexMatch ? Number(indexMatch[1]) : discovered.size + 1;
+        const size = Number(parsed.searchParams.get("ts_size") || 0);
+        if (!discovered.has(index)) {
+          if (size > 0) {
+            parsed.searchParams.set("range", "0-" + (size - 1));
+            parsed.searchParams.set("len", String(size));
           }
-          discoveredChunks.set(chunkIdx, {
-            url: parsed.toString(),
-            size: tsSize,
-          });
+          discovered.set(index, { url: parsed.toString(), size });
         }
-      } catch {
-        // Fallback for relative or non-standard URLs
-        const chunkIdx = discoveredChunks.size + 1;
-        if (!discoveredChunks.has(chunkIdx)) {
-          discoveredChunks.set(chunkIdx, { url: segUrl, size: 0 });
-        }
-      }
+      } catch {}
     }
   };
 
-  // 1. Fetch initial M3U8
-  const res = await fetch(m3u8Url, { headers });
-  if (!res.ok) {
-    throw new Error(`Failed to fetch M3U8 playlist: HTTP ${res.status}`);
-  }
-  const initialPlaylistText = await res.text();
-  parseSegmentsFromM3u8(initialPlaylistText);
+  const first = await fetch(m3u8Url, { headers });
+  if (!first.ok) throw new Error("Failed to fetch M3U8 playlist: HTTP " + first.status);
+  parseSegments(await first.text());
 
-  // 2. Multi-chunk discovery across video timeline if streaming parameters are available
-  const parsedM3u8Url = new URL(m3u8Url);
-  const uk = metadata?.uk || parsedM3u8Url.searchParams.get("uk");
-  const shareid = metadata?.shareId || parsedM3u8Url.searchParams.get("shareid");
-  const fid = metadata?.fsId || parsedM3u8Url.searchParams.get("fid");
-  const sign = metadata?.sign || parsedM3u8Url.searchParams.get("sign");
-  const timestamp = metadata?.timestamp || parsedM3u8Url.searchParams.get("timestamp");
+  const parsed = new URL(m3u8Url);
+  const uk = metadata?.uk || parsed.searchParams.get("uk");
+  const shareid = metadata?.shareId || parsed.searchParams.get("shareid");
+  const fid = metadata?.fsId || parsed.searchParams.get("fid");
+  const sign = metadata?.sign || parsed.searchParams.get("sign");
+  const timestamp = metadata?.timestamp || parsed.searchParams.get("timestamp");
 
   if (uk && shareid && fid && sign && timestamp) {
-    // If we have duration, probe in 25-second increments to cover the full duration
-    // If duration is unknown, probe up to 7200s (2 hours) or until 3 consecutive steps yield no new chunks
-    const maxScanTime = metadata?.duration && metadata.duration > 0
-      ? metadata.duration + 30
-      : 7200;
-
+    const maxScanTime = metadata?.duration && metadata.duration > 0 ? metadata.duration + 30 : 3600;
     let emptyStreak = 0;
-    const stepSeconds = 25;
 
-    for (let t = stepSeconds; t <= maxScanTime; t += stepSeconds) {
+    for (let t = 25; t <= maxScanTime; t += 25) {
       try {
-        if (metadata?.beforeChunk) {
-          await metadata.beforeChunk();
-        }
-        const timeStreamUrl = `https://www.terabox.app/share/streaming?app_id=250528&web=1&channel=dubox&clienttype=0&shareid=${shareid}&uk=${uk}&fid=${fid}&sign=${encodeURIComponent(
-          sign
-        )}&timestamp=${timestamp}&type=M3U8_AUTO_480&time=${t}&esl=1&isplayer=1&ehps=1`;
+        await metadata?.beforeChunk?.();
 
-        const timeRes = await fetch(timeStreamUrl, { headers });
-        if (timeRes.ok) {
-          const timeText = await timeRes.text();
-          const prevCount = discoveredChunks.size;
-          parseSegmentsFromM3u8(timeText);
-          if (discoveredChunks.size > prevCount) {
-            emptyStreak = 0;
-          } else {
-            emptyStreak++;
-            // If duration wasn't known and we haven't found any new chunks for 4 consecutive intervals (~100s), stop scanning
-            if (!metadata?.duration && emptyStreak >= 4 && discoveredChunks.size > 0) {
-              break;
-            }
-          }
-        }
-      } catch (scanErr) {
-        console.warn(`Timeline probe failed at t=${t}:`, scanErr);
-      }
+        const probe = new URL("https://www.terabox.app/share/streaming");
+        probe.searchParams.set("app_id", "250528");
+        probe.searchParams.set("web", "1");
+        probe.searchParams.set("channel", "dubox");
+        probe.searchParams.set("clienttype", "0");
+        probe.searchParams.set("shareid", shareid);
+        probe.searchParams.set("uk", uk);
+        probe.searchParams.set("fid", fid);
+        probe.searchParams.set("sign", sign);
+        probe.searchParams.set("timestamp", timestamp);
+        probe.searchParams.set("type", "M3U8_AUTO_480");
+        probe.searchParams.set("time", String(t));
+        probe.searchParams.set("esl", "1");
+        probe.searchParams.set("isplayer", "1");
+        probe.searchParams.set("ehps", "1");
+
+        const response = await fetch(probe, { headers });
+        if (!response.ok) continue;
+
+        const before = discovered.size;
+        parseSegments(await response.text());
+        if (discovered.size === before) emptyStreak++;
+        else emptyStreak = 0;
+
+        if (!metadata?.duration && emptyStreak >= 4 && discovered.size) break;
+      } catch {}
     }
   }
 
-  // Sort discovered chunks by index
-  const sortedChunkIndices = Array.from(discoveredChunks.keys()).sort((a, b) => a - b);
-  if (sortedChunkIndices.length === 0) {
-    throw new Error("M3U8 playlist contained no video segments");
-  }
+  const indices = [...discovered.keys()].sort((a, b) => a - b);
+  if (!indices.length) throw new Error("M3U8 playlist contained no video segments");
 
-  console.log(`Discovered ${sortedChunkIndices.length} video chunks across timeline`);
-
-  const tempTsPath = `${outputMp4Path}.temp.ts`;
-  const outWriteStream = fs.createWriteStream(tempTsPath);
+  const tempTsPath = outputMp4Path + ".temp.ts";
+  const out = fs.createWriteStream(tempTsPath);
 
   try {
-    for (let i = 0; i < sortedChunkIndices.length; i++) {
-      if (metadata?.beforeChunk) {
-        await metadata.beforeChunk();
-      }
-      const idx = sortedChunkIndices[i];
-      const chunk = discoveredChunks.get(idx)!;
-
-      const segRes = await fetch(chunk.url, {
+    for (let i = 0; i < indices.length; i++) {
+      await metadata?.beforeChunk?.();
+      const chunk = discovered.get(indices[i])!;
+      const response = await fetch(chunk.url, {
         headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-          Referer: refererUrl || "https://www.terabox.app/",
+          "User-Agent": headers["User-Agent"],
+          Referer: headers.Referer,
+          ...(effectiveCookies ? { Cookie: effectiveCookies } : {}),
         },
       });
 
-      if (!segRes.ok) {
-        throw new Error(`Failed to fetch segment ${i + 1}/${sortedChunkIndices.length}`);
-      }
+      if (!response.ok) throw new Error("Failed to fetch segment " + (i + 1) + "/" + indices.length);
 
-      const arrayBuffer = await segRes.arrayBuffer();
-      outWriteStream.write(Buffer.from(arrayBuffer));
-
-      if (onProgress) {
-        const percent = Math.round(((i + 1) / sortedChunkIndices.length) * 100);
-        onProgress(percent, i + 1, sortedChunkIndices.length);
-      }
+      out.write(Buffer.from(await response.arrayBuffer()));
+      onProgress?.(Math.round(((i + 1) / indices.length) * 100), i + 1, indices.length);
     }
   } finally {
-    await new Promise<void>((resolve) => {
-      outWriteStream.end(() => resolve());
-    });
+    await new Promise<void>((resolve) => out.end(resolve));
   }
 
-  // Remux .ts into .mp4 using ffmpeg for optimal streaming and compatibility
   try {
     await execFileAsync("ffmpeg", ["-y", "-i", tempTsPath, "-c", "copy", outputMp4Path]);
-  } catch (ffmpegErr) {
-    console.warn("FFmpeg remux warning, keeping original ts file:", ffmpegErr);
+  } catch (error) {
+    console.warn("FFmpeg remux failed; keeping TS data:", error);
     fs.copyFileSync(tempTsPath, outputMp4Path);
   } finally {
-    if (fs.existsSync(tempTsPath)) {
-      fs.unlinkSync(tempTsPath);
-    }
+    if (fs.existsSync(tempTsPath)) fs.unlinkSync(tempTsPath);
   }
 }
 
@@ -1282,8 +762,9 @@ export async function unpackZipArchive(
   targetDir: string
 ): Promise<{ path: string; filename: string; size: number }[]> {
   const results: { path: string; filename: string; size: number }[] = [];
+  fs.mkdirSync(targetDir, { recursive: true });
+
   try {
-    fs.mkdirSync(targetDir, { recursive: true });
     const directory = await unzipper.Open.file(zipPath);
     const usedNames = new Set<string>();
 
@@ -1293,24 +774,26 @@ export async function unpackZipArchive(
       const baseName = cleanFilename(path.basename(entry.path));
       let filename = baseName;
       let suffix = 1;
+
       while (usedNames.has(filename)) {
-        const extension = path.extname(baseName);
-        const stem = extension ? baseName.slice(0, -extension.length) : baseName;
-        filename = `${stem}_${suffix++}${extension}`;
+        const ext = path.extname(baseName);
+        const stem = ext ? baseName.slice(0, -ext.length) : baseName;
+        filename = stem + "_" + suffix++ + ext;
       }
+
       usedNames.add(filename);
 
       const outputPath = path.join(targetDir, filename);
       await pipeline(entry.stream(), fs.createWriteStream(outputPath));
-      const stats = fs.statSync(outputPath);
       results.push({
         path: outputPath,
         filename,
-        size: stats.size,
+        size: fs.statSync(outputPath).size,
       });
     }
-  } catch (err: any) {
-    console.error("ZIP Unpack error:", err);
+  } catch (error) {
+    console.error("ZIP unpack error:", error);
   }
+
   return results;
 }
