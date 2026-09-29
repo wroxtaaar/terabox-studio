@@ -476,6 +476,41 @@ async function resolveTeraboxViaChromium(rawUrl: string): Promise<ResolvedMetada
         Object.defineProperty(navigator, "webdriver", { get: () => undefined });
         Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
         Object.defineProperty(navigator, "platform", { get: () => "Linux x86_64" });
+        Object.defineProperty(navigator, "hardwareConcurrency", { get: () => 4 });
+        Object.defineProperty(navigator, "deviceMemory", { get: () => 8 });
+
+        const chrome = (globalThis as any).chrome;
+        if (!chrome) {
+          Object.defineProperty(globalThis, "chrome", {
+            configurable: false,
+            enumerable: true,
+            value: { runtime: {} },
+          });
+        }
+
+        try {
+          Object.defineProperty(navigator, "plugins", {
+            get: () => [
+              { name: "Chrome PDF Plugin" },
+              { name: "Chrome PDF Viewer" },
+              { name: "Native Client" },
+            ],
+          });
+        } catch {}
+
+        try {
+          const originalQuery = navigator.permissions?.query?.bind(navigator.permissions);
+          if (originalQuery) {
+            Object.defineProperty(navigator.permissions, "query", {
+              value: (parameters: PermissionDescriptor) => {
+                if (parameters?.name === "notifications") {
+                  return Promise.resolve({ state: Notification.permission });
+                }
+                return originalQuery(parameters);
+              },
+            });
+          }
+        } catch {}
       });
 
       const page = await context.newPage();
@@ -488,6 +523,14 @@ async function resolveTeraboxViaChromium(rawUrl: string): Promise<ResolvedMetada
       const summaries: string[] = [];
       const networkErrors: string[] = [];
       const responseJobs = new Set<Promise<void>>();
+
+      page.on("download", (download) => {
+        const url = download.url();
+        if (url && /^https?:\\/\\/i.test(url) && !downloadUrls.includes(url)) {
+          downloadUrls.push(url);
+          console.log("Chromium browser download captured:", url.slice(0, 320));
+        }
+      });
 
       page.on("console", (msg) => {
         if (/error|warning/i.test(msg.type())) {
@@ -520,6 +563,31 @@ async function resolveTeraboxViaChromium(rawUrl: string): Promise<ResolvedMetada
 
       console.log("TeraBox resolver mode: Playwright + Chromium only");
       console.log("Chromium executable:", chromiumPath());
+      console.log("Chromium browser version:", browser.version());
+      console.log("Chromium resolver: bootstrapping browser session");
+
+      // Start from a real TeraBox origin first so the browser gets the same
+      // session/bootstrap cookies and frontend state as a normal Chrome visit.
+      const warmupOrigins = [
+        "https://www.terabox.app/",
+        "https://www.terabox.com/",
+      ];
+      for (const origin of warmupOrigins) {
+        try {
+          const warmup = await page.goto(origin, {
+            waitUntil: "domcontentloaded",
+            timeout: 12000,
+          });
+          console.log("Chromium warmup status=" + (warmup?.status() ?? "none") + " url=" + page.url());
+          await page.waitForTimeout(1200);
+        } catch (error) {
+          console.log(
+            "Chromium warmup failed:",
+            error instanceof Error ? error.message : String(error)
+          );
+        }
+      }
+
       console.log("Chromium resolver: opening TeraBox share page");
 
       const navigation = await page.goto(rawUrl, {
@@ -546,6 +614,195 @@ async function resolveTeraboxViaChromium(rawUrl: string): Promise<ResolvedMetada
 
       await Promise.allSettled([...responseJobs]);
       await scrapeDom(page, metadata, files, downloadUrls, streamUrls);
+
+      // Some current TeraBox builds do not expose the share API in a way that
+      // our response observer can see. Ask the same Chromium page to execute
+      // the share APIs with real browser credentials, and try both public shorturl
+      // forms because different share domains normalize the leading "1".
+      if (files.size === 0) {
+        const browserApi = await page.evaluate(async (rawShortCode) => {
+          const values = [
+            rawShortCode,
+            rawShortCode.startsWith("1") ? rawShortCode.slice(1) : "1" + rawShortCode,
+          ].filter((value, index, array) => value && array.indexOf(value) === index);
+
+          const errors: string[] = [];
+          const tokenSources: Record<string, string> = {};
+
+          const addToken = (name: string, value: unknown) => {
+            if (value === undefined || value === null) return;
+            const text = String(value).trim();
+            if (text && !tokenSources[name]) tokenSources[name] = text;
+          };
+
+          const tokenText = [
+            document.documentElement?.innerHTML || "",
+            document.documentElement?.textContent || "",
+          ].join("\\n");
+
+          const tokenPatterns: Array<[string, RegExp]> = [
+            ["jsToken", /(?:window\\.)?jsToken\\s*[=:]\\s*["']([^"']+)["']/i],
+            ["jsTokenFn", /fn\\(["']([A-F0-9]+)["']\\)/i],
+            ["dpLogId", /(?:dp-logid|dpLogId)\\s*[=:]\\s*["']?([0-9]+)/i],
+            ["bdstoken", /(?:bdstoken|bdstoken)\\s*[=:]\\s*["']([^"']+)["']/i],
+          ];
+
+          for (const [name, pattern] of tokenPatterns) {
+            const match = tokenText.match(pattern);
+            if (match?.[1]) addToken(name, match[1]);
+          }
+
+          for (const storageName of ["localStorage", "sessionStorage"]) {
+            try {
+              const storage = storageName === "localStorage" ? window.localStorage : window.sessionStorage;
+              for (let i = 0; i < storage.length; i++) {
+                const key = storage.key(i);
+                if (!key) continue;
+                const value = storage.getItem(key) || "";
+                if (/jstoken/i.test(key)) addToken("jsToken", value);
+                if (/dp.?log/i.test(key)) addToken("dpLogId", value);
+                if (/bdstoken/i.test(key)) addToken("bdstoken", value);
+              }
+            } catch {}
+          }
+
+          for (const key of Object.keys(window)) {
+            if (/(?:token|share|yunData|initData|initialData|initialState)/i.test(key)) {
+              try {
+                const value = (window as any)[key];
+                if (typeof value === "string") {
+                  if (/jstoken/i.test(key)) addToken("jsToken", value);
+                  if (/bdstoken/i.test(key)) addToken("bdstoken", value);
+                  if (/dp.?log/i.test(key)) addToken("dpLogId", value);
+                }
+              } catch {}
+            }
+          }
+
+          const callJson = async (path: string, params: Record<string, string>) => {
+            const url = new URL(path, location.origin);
+            for (const [key, value] of Object.entries(params)) {
+              if (value) url.searchParams.set(key, value);
+            }
+
+            const response = await fetch(url.toString(), {
+              method: "GET",
+              credentials: "include",
+              cache: "no-store",
+              headers: {
+                Accept: "application/json, text/plain, */*",
+                "X-Requested-With": "XMLHttpRequest",
+              },
+            });
+
+            const text = await response.text();
+            let payload: any = null;
+            try { payload = text ? JSON.parse(text) : null; } catch {}
+
+            return {
+              status: response.status,
+              payload,
+              text: text.slice(0, 1200),
+            };
+          };
+
+          let info: any = null;
+          const lists: any[] = [];
+
+          for (const variant of values) {
+            try {
+              const params: Record<string, string> = {
+                app_id: "250528",
+                shorturl: variant,
+                root: "1",
+                web: "1",
+                channel: "dubox",
+                clienttype: "0",
+              };
+              if (tokenSources.jsToken) params.jsToken = tokenSources.jsToken;
+              if (tokenSources.dpLogId) params["dp-logid"] = tokenSources.dpLogId;
+
+              const result = await callJson("/api/shorturlinfo", params);
+              errors.push(
+                "shorturlinfo=" + variant +
+                " HTTP=" + result.status +
+                " errno=" + String(result.payload?.errno ?? "unknown")
+              );
+
+              if (result.status >= 200 && result.status < 300 &&
+                  Number(result.payload?.errno ?? 0) === 0 &&
+                  Array.isArray(result.payload?.list)) {
+                info = result.payload;
+                break;
+              }
+            } catch (error) {
+              errors.push(
+                "shorturlinfo=" + variant +
+                " " + (error instanceof Error ? error.message : String(error))
+              );
+            }
+          }
+
+          const listShortUrl =
+            info?.shorturl ||
+            info?.shorturlinfo?.shorturl ||
+            values[0] ||
+            rawShortCode;
+
+          for (const variant of [listShortUrl, ...values]) {
+            if (lists.length) break;
+            try {
+              const params: Record<string, string> = {
+                app_id: "250528",
+                web: "1",
+                channel: "0",
+                clienttype: "0",
+                shorturl: variant,
+                page: "1",
+                num: "100",
+                by: "name",
+                order: "asc",
+                root: "1",
+              };
+              if (tokenSources.jsToken) params.jsToken = tokenSources.jsToken;
+              if (tokenSources.dpLogId) params["dp-logid"] = tokenSources.dpLogId;
+
+              const result = await callJson("/share/list", params);
+              errors.push(
+                "share/list=" + variant +
+                " HTTP=" + result.status +
+                " errno=" + String(result.payload?.errno ?? "unknown")
+              );
+
+              if (result.status >= 200 && result.status < 300 &&
+                  Number(result.payload?.errno ?? 0) === 0 &&
+                  Array.isArray(result.payload?.list)) {
+                lists.push(...result.payload.list);
+              }
+            } catch (error) {
+              errors.push(
+                "share/list=" + variant +
+                " " + (error instanceof Error ? error.message : String(error))
+              );
+            }
+          }
+
+          return { info, lists, tokens: tokenSources, errors };
+        }, shortCode);
+
+        console.log(
+          "Chromium in-page resolver:",
+          "tokens=" + Object.keys(browserApi.tokens).join(",") || "none",
+          "info=" + (browserApi.info ? "yes" : "no"),
+          "listItems=" + browserApi.lists.length,
+          "errors=" + browserApi.errors.slice(-6).join(" | ")
+        );
+
+        if (browserApi.info || browserApi.lists.length) {
+          collectMetadataAndFiles(browserApi.info, metadata, files);
+          collectMetadataAndFiles(browserApi.lists, metadata, files);
+        }
+      }
 
       if (files.size === 0 && downloadUrls.length === 0 && streamUrls.length === 0) {
         await maybeTriggerDownloadAction(page, downloadUrls);
